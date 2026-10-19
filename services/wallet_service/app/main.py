@@ -74,6 +74,7 @@ PUBLIC_PATHS = {
 SERVICE_KEY_OPERATIONS = {
     ("POST", "/wallet/debit"),
     ("POST", "/wallet/credit"),
+    ("POST", "/wallet/refund"),
 }
 
 
@@ -214,6 +215,7 @@ async def wallet_security_boundary(
         "/wallet/withdraw",
         "/wallet/credit",
         "/wallet/debit",
+        "/wallet/refund",
         "/subscription/signup",
         "/subscription/renew",
         "/subscription/cancel",

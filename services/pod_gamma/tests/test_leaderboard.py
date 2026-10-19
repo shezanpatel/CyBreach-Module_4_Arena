@@ -239,12 +239,27 @@ class TestResetLeaderboard:
 class TestHealthAndMetrics:
     """Tests for GET /health and GET /metrics."""
 
-    def test_health_check(self, client: TestClient) -> None:
+    def test_health_check(self, client: TestClient, monkeypatch) -> None:
+        from app.api import leaderboard as leaderboard_api
+
+        class ReadySession:
+            async def __aenter__(self):
+                return self
+
+            async def __aexit__(self, *_args):
+                return None
+
+            async def execute(self, _query):
+                return 1
+
+        monkeypatch.setattr(leaderboard_api, "SessionLocal", ReadySession)
+        monkeypatch.setattr(leaderboard_api, "is_redis_healthy", lambda: True)
         response = client.get("/health")
         assert response.status_code == 200
         data = response.json()
         assert data["app"] == "running"
         assert data["redis"] == "connected"
+        assert data["database"] == "connected"
         assert data["status"] == "healthy"
 
     def test_metrics(self, client: TestClient) -> None:

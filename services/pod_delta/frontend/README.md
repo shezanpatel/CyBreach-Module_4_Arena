@@ -83,8 +83,14 @@ server-side delegated token; that secret is never sent to the browser.
   Benchmark values are exact seeded synthetic baselines for the demo; they are
   not real organization or private peer data, and differential privacy is not
   applied to these synthetic values.
-- `services/pod_alpha` currently contains no runnable API. The repository's
-  `services/wallet_service` is the available wallet backend.
+- Pod Alpha is the Wallet Service in `services/wallet_service`. The frontend's
+  Services view shows its live health through Pod Delta. Authenticated
+  non-demo sessions read wallet data from that API and can inspect a paginated,
+  date/type/module-filtered audit trail or export the filtered ledger to CSV.
+  Finance-admin tokens can select a tenant; ordinary users remain scoped to
+  their own wallet. The local demo
+  wallet and its top-ups remain in Delta's in-memory simulator and are never
+  presented as Pod Alpha ledger entries.
 
 ## Build
 

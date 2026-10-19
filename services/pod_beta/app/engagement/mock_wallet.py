@@ -52,6 +52,7 @@ class MockWalletClient:
                 "tenant_medium": 50,
                 "tenant_high": 200,
                 "tenant_whale": 999999,
+                "preview-tenant": 999999,
                 # Also generic aliases
                 "tenant_1": 0,
                 "tenant_2": 10,

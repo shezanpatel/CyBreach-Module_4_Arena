@@ -43,26 +43,21 @@ different addresses. The default URLs are for local development; do not expose
 the Beta, Gamma, or Wallet APIs publicly. Keep them on a private service
 network and expose only the authenticated Delta gateway.
 
-The local demo account issues a short-lived token only when
-`ENVIRONMENT=development`, `DEV_DEMO_AUTH_ENABLED=true`, and the request is
-from a loopback client. The shared credentials are
-`manager@cybreach.demo` / `ArenaDemo2026!` by default; configure
-`DEMO_ACCOUNT_ID`, `DEMO_ACCOUNT_PASSWORD`, and `DEMO_STARTING_CREDITS` to
-override them locally. This is not production authentication. The Wallet API
-validates JWT signatures independently. Configure
+The handover configuration disables local demo login. The browser accepts an
+organization-issued bearer token and validates it through the Delta gateway;
+configure a trusted identity provider and token verification policy before
+operator use. The current code does not implement an identity-provider login
+or JWKS key rotation, so an externally issued token must use the configured
+Delta signing/verification contract. The Wallet API validates delegated JWT
+signatures independently. Configure
 `WALLET_SERVICE_JWT_SECRET` on Delta to match the Wallet service's
 `JWT_SECRET_KEY`; Delta creates a short-lived server-side delegation token.
 Because Wallet authorizes per-user balance/history paths against its
 `tenant_id` claim, Delta scopes the delegated token's tenant to the authenticated
 subject used for that user's wallet path.
-Demo top-ups, receipts, scans, ledger, notifications, and analytics use only
-Delta's in-memory demo state. Checkout collects billing name, email, and address
-for a simulated receipt, and uses fixed demo card/UPI instruments; it never
-collects real card or bank credentials. Each checkout has a replay-safe ID, and
-receipts are retained in the demo state until reset. Payments are always
-simulated and no external targets are contacted. Restart Delta or select
-**Reset demo** to restore the initial state. Production must use the real
-identity provider and production secrets, with local demo auth disabled.
+The frontend does not offer simulated payments or scan results in the handover
+configuration. Wallet reads use Pod Alpha; no real-money payment provider is
+configured, so top-ups and charges are unavailable.
 
 Simulated top-up receipts can be downloaded as printable HTML or printed to
 PDF from a standalone receipt document, avoiding the scrollable checkout dialog.
@@ -77,15 +72,20 @@ The gateway provides read-only UI integration for campaign catalog,
 engagement recommendations, leaderboard, benchmark, and health. Pod Gamma
 exposes `GET /benchmark/cohorts`; Delta proxies the authenticated request, and
 the frontend builds its selectors only from cohorts meeting Gamma's minimum
-peer threshold. Benchmark values are exact seeded synthetic baselines, not real
-organization or private peer data; differential privacy is not applied to
-these demo values. In demo
-sessions, wallet, top-up, scan-run, notification, and analytics operations
-stay inside the simulated demo ledger; they do not invoke Wallet checkout or
-Pod Beta engagement creation.
+peer threshold. Gamma reads persisted benchmark aggregates and Compose does not
+load benchmark seed files. Check existing database contents for legacy sample
+records before handover; do not delete persistent volumes or records without
+review. Empty benchmark results are expected until approved real aggregates
+exist.
 
-`services/pod_alpha` is empty in this checkout; the wallet backend is located
-at `services/wallet_service`.
+Pod Alpha is the Wallet Service from
+https://github.com/upretisuman776/Wallet-Service. This checkout keeps the
+canonical runnable service in `services/wallet_service`; `services/pod_alpha`
+is a compatibility package path, not a second API. Delta's
+`WALLET_SERVICE_URL` defaults to `http://127.0.0.1:8004`. The Wallet API is
+reachable there for health checks, and authenticated accounts can read their
+balance and ledger through Delta. The handover UI does not create transactions
+or accept payments.
 
 The Vite frontend proxies `/api` to `http://127.0.0.1:8000` in development.
 Start each API on its assigned port before opening the frontend. The Services
@@ -154,6 +154,31 @@ Check Analytics Engine and published event:
 curl "http://127.0.0.1:8000/api/v1/analytics?tenant_id=tenant-a"
 docker compose exec redpanda rpk topic consume analytics.report --brokers redpanda:9092 --num 1
 ```
+
+## Current Cross-Pod Boundaries
+
+The supported browser path is Browser -> Pod Delta gateway -> Pod Beta campaign
+catalog / Pod Gamma leaderboard and benchmarks / Pod Alpha wallet for an
+authenticated non-demo account. This is request routing, not a peer-to-peer
+mesh. A green upstream health result means only that the configured health URL
+responded.
+
+The event architecture is not yet a complete cross-pod pipeline in this
+checkout. Pod Delta consumes the configured Redpanda topics and publishes its
+own notification, analytics, and score-display events. Pod Beta's engagement
+service currently uses an in-memory event bus and mock wallet; its lifecycle
+events are not published to Delta's Redpanda topics. Pod Gamma serves its own
+leaderboard and benchmark API and is not currently updated from Beta lifecycle
+events.
+
+Therefore, do not treat the UI's service-health count as proof of shared event
+data. Gamma APIs also need authentication and tenant authorization before
+deployment beyond an isolated trusted network. A complete event-driven
+engagement-to-wallet-to-leaderboard loop requires
+replacing Beta's mock wallet with the Alpha wallet integration and connecting
+Beta/Gamma producers and consumers to shared event contracts, with durable
+state and end-to-end tests. The manual Delta topic checks below validate
+Delta's broker integration only.
 
 ## Tests
 

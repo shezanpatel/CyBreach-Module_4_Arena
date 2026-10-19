@@ -7,3 +7,12 @@ __pycache__/
 .coverage 
 htmlcov/ 
 .env
+
+# Runtime / local artifacts (not source)
+*.log
+*.zip
+*.pdf
+*.tmp-*
+.vscode/
+.DS_Store
+Thumbs.db

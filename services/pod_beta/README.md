@@ -5,22 +5,26 @@ Pod Beta contains two FastAPI applications:
 - Campaign catalog on `app.campaign.api:app`: campaign browsing and creation,
   hash verification, scheduling, and staged boss-fight endpoints.
 - Engagement manager on `app.engagement.api:app`: engagement creation,
-  lifecycle transitions, recommendations, and reports. It uses a local mock
-  wallet and in-memory engagement state in this checkout.
+  lifecycle transitions, recommendations, and reports. Engagement records are
+  stored in the configured SQLAlchemy database (`DATABASE_URL`, SQLite by
+  default). Pod Beta defaults to the authenticated Wallet service with its `CRD`
+  credit unit; set `BETA_WALLET_MODE=mock` explicitly for local demo/test runs. API-created
+  campaign definitions, schedules, cooldowns, boss-fight sessions, and event
+  outbox records are persisted in the configured SQLAlchemy database. Kafka
+  delivery is enabled with `KAFKA_ENABLE=true`.
 
-The local Arena frontend uses the campaign catalog and engagement API as
-configured upstreams. However, the demo scan/run workflow intentionally
-generates sample findings in Pod Delta; it does not create or execute a Pod Beta
-engagement. Do not present those demo scan reports as live security testing.
+The Arena local-lab workflow can collect HTTP response headers from the
+loopback-only Juice Shop target and submit them through Pod Beta's engagement
+lifecycle. If lab mode is disabled or unavailable, Delta can show its separately
+labeled sample simulation instead. Neither path is a test of customer systems.
 
 ## Requirements
 
 - Python 3.12 recommended
 - FastAPI, Uvicorn, Pydantic 2, and SQLAlchemy 2
 
-This source-only service currently has no dedicated `requirements.txt`, Docker
-Compose file, or separate Pod Beta test command. Install the dependencies in a
-virtual environment and run tests from the repository root using
+This source-only service currently has no Docker Compose file. Install the
+dependencies in a virtual environment and run tests from the repository root using
 [`run-all-tests.ps1`](../../run-all-tests.ps1).
 
 ## Install and run (PowerShell)
@@ -32,8 +36,13 @@ Set-Location services\pod_beta
 python -m venv .venv
 .\.venv\Scripts\Activate.ps1
 python -m pip install --upgrade pip
-pip install fastapi uvicorn "pydantic>=2,<3" "sqlalchemy>=2,<3"
+pip install -r requirements.txt
 ```
+
+Copy `.env.example` to `.env` and set `BETA_JWT_SECRET` to the same value as
+Pod Delta's `SECRET_KEY`. Keep `BETA_WALLET_MODE=mock` for local preview; for
+real tenant transactions, use `service`, configure the Wallet JWT/API secrets,
+and provision tenant `CRD` balances first.
 
 Start the campaign catalog in one terminal:
 
@@ -67,10 +76,16 @@ If you use different ports, update `POD_BETA_CAMPAIGN_URL` and
 - Engagement create: `POST /engagement/create`
 - Engagement report: `GET /engagement/{id}/report`
 
-Check the OpenAPI docs for required authentication headers and payloads.
-Campaign definitions are loaded from the Pod Beta fixtures directory. Engagement
-state and its mock wallet are process-local demo state and may reset when the
-service restarts.
+Check the OpenAPI docs for request payloads. All API routes require a JWT with a
+tenant claim signed by `BETA_JWT_SECRET`; tenant-owned engagements, schedules,
+recommendations, and boss-fight operations are checked against that claim.
+Campaign fixtures are overlaid by persisted API-created definitions. Engagements,
+campaign changes, schedules, cooldown timestamps, boss-fight sessions, and the
+event outbox survive restarts when the configured database is retained. Boss-fight
+stage transitions are also saved and read from the database. Configure
+`BETA_WALLET_MODE` and the Wallet credentials to select the real `CRD` ledger or
+the local mock.
+Enable Kafka to publish and replay pending outbox records.
 
 ## Tests
 

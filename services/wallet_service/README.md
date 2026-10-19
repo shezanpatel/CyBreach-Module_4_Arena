@@ -32,18 +32,24 @@ docker compose up -d postgres redpanda
 uvicorn app.main:app --reload --host 127.0.0.1 --port 8000
 ```
 
-The included Compose file also defines the Wallet API container and publishes
-it on host port `8000`. If running Uvicorn on the host, do not start that
-container at the same time, or change its host port mapping. In an integrated
-local stack, configure Delta's `WALLET_SERVICE_URL` to the Wallet API's host
-address and port (default documented by Delta is `http://127.0.0.1:8004`).
-Adjust the Wallet Compose mapping to `8004:8000` if using the container and that
-port.
+The included Compose file publishes the Wallet API as Pod Alpha on
+`127.0.0.1:8004`, matching Delta's default `WALLET_SERVICE_URL`. The database,
+broker, and API ports are bound to loopback for local development. If running
+Uvicorn on the host, stop the Compose API container first or use a different
+host port.
 
 The `.env.example` file is a development template, not a production config.
-`DATABASE_URL`, `JWT_SECRET_KEY`, `SERVICE_API_KEY`, and Kafka/database settings
-must agree with the actual local deployment. Use unique, private values in any
-shared or deployed environment.
+Generate unique local values for `JWT_SECRET_KEY` and `SERVICE_API_KEY` before
+starting the service. Set Delta's `WALLET_SERVICE_JWT_SECRET` to the exact same
+value as the Wallet `JWT_SECRET_KEY`. The Compose file supplies the internal
+database and broker addresses to the API container; host-run API processes use
+the localhost values in `.env.example`.
+
+For example, generate a signing secret in PowerShell with
+`python -c "import secrets; print(secrets.token_urlsafe(48))"`. Put that value
+in `JWT_SECRET_KEY` in this service's `.env` and in
+`WALLET_SERVICE_JWT_SECRET` in Delta's `.env`. Keep `SERVICE_API_KEY` private;
+Delta's current read-only wallet gateway does not need it.
 
 ## API documentation
 

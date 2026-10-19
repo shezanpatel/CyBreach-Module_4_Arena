@@ -18,9 +18,9 @@ benchmark endpoints, and additional Arena analytics/streak/badge routes.
 - Opt-in metadata cannot change while absolute or improvement scores exist.
   User deletion cleans associated dimension indexes; leaderboard reset clears
   absolute and improvement rankings.
-- Benchmark, comparison, and trend endpoints use exact seeded synthetic demo
-  data. They are labelled as synthetic, are not real/private peer data, and do
-  not apply differential privacy.
+- Benchmark, comparison, and trend endpoints read persisted aggregates from
+  PostgreSQL. No benchmark data is seeded; these endpoints return empty/not-found
+  results until approved, privacy-thresholded real aggregates are loaded.
 
 ## Requirements
 
@@ -76,7 +76,7 @@ endpoints include:
 
 | Method and path | Purpose |
 | --- | --- |
-| `GET /health` | App and Redis health |
+| `GET /health` | App, Redis, and PostgreSQL readiness |
 | `GET /leaderboard?limit=10` | Global absolute ranking |
 | `GET /leaderboard/{dimension}` | Global, industry, region, or size absolute ranking |
 | `POST /score` | Add/update a global or tenant-aware score |
@@ -86,10 +86,10 @@ endpoints include:
 | `POST /opt-in` / `POST /opt-out` | Manage tenant leaderboard consent |
 | `DELETE /user/{username}` | Remove a player and associated dimension indexes |
 | `DELETE /leaderboard` | Reset absolute and improvement indexes |
-| `GET /benchmark/cohorts` | List seeded cohorts meeting the peer threshold |
-| `POST /benchmark` | Read a seeded cohort baseline |
-| `POST /benchmark/compare` | Compare regional and global synthetic baselines |
-| `GET /benchmark/trend/{tenant_id}` | Read seeded historical synthetic trend |
+| `GET /benchmark/cohorts` | List persisted cohorts meeting the peer threshold |
+| `POST /benchmark` | Read a persisted cohort aggregate |
+| `POST /benchmark/compare` | Compare persisted regional and global aggregates |
+| `GET /benchmark/trend/{tenant_id}` | Read persisted historical trend |
 
 Non-global leaderboard filters are `industry`, `region`, and `size_band`.
 Improvement filters use `dimension` and `value`. Review API schemas in the
@@ -110,7 +110,8 @@ curl.exe -X POST http://127.0.0.1:8000/score `
 ```
 
 After opt-out, score and improvement writes are rejected until the tenant
-consents again. Do not send real organization data to the seeded benchmark API.
+consents again. Benchmark aggregates require an approved data ingestion and
+privacy review process before real organization data is used.
 
 ## Tests
 

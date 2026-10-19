@@ -3,6 +3,8 @@ $ErrorActionPreference = "Continue"
 $root = $PSScriptRoot
 $basePython = Join-Path $root ".venv\Scripts\python.exe"
 $failedSuites = [System.Collections.Generic.List[string]]::new()
+$previousBetaWalletMode = [Environment]::GetEnvironmentVariable("BETA_WALLET_MODE", "Process")
+[Environment]::SetEnvironmentVariable("BETA_WALLET_MODE", "mock", "Process")
 
 $suites = @(
     @{
@@ -35,6 +37,7 @@ foreach ($suite in $suites) {
         Pop-Location
     }
 }
+[Environment]::SetEnvironmentVariable("BETA_WALLET_MODE", $previousBetaWalletMode, "Process")
 
 $walletVariables = @{
     APP_NAME = "CyBreach Wallet Service"
@@ -60,18 +63,20 @@ $walletPython = Join-Path $walletDirectory ".venv312\Scripts\python.exe"
 $walletDatabaseReady = $false
 
 try {
-    docker exec wallet-pytest-db pg_isready -U wallet_user -d wallet_db *> $null
-    $walletDatabaseReady = $LASTEXITCODE -eq 0
-
-    if (-not $walletDatabaseReady) {
-        Write-Host "`nWallet tests skipped: wallet-pytest-db is not ready."
-        $failedSuites.Add("wallet_service (database unavailable)")
-    }
-    elseif (-not (Test-Path $walletPython)) {
+    if (-not (Test-Path $walletPython)) {
         Write-Host "`nWallet tests skipped: Python environment services\wallet_service\.venv312 is missing."
         $failedSuites.Add("wallet_service (Python environment missing)")
     }
     else {
+        & $walletPython -c "import os, psycopg; psycopg.connect(os.environ['DATABASE_URL'].replace('postgresql+psycopg://','postgresql://'), connect_timeout=3).close()" *> $null
+        $walletDatabaseReady = $LASTEXITCODE -eq 0
+    }
+
+    if ((Test-Path $walletPython) -and -not $walletDatabaseReady) {
+        Write-Host "`nWallet tests skipped: wallet-pytest-db is not ready."
+        $failedSuites.Add("wallet_service (database unavailable)")
+    }
+    elseif ((Test-Path $walletPython) -and $walletDatabaseReady) {
         Write-Host "`n=== wallet_service: preparing test database ==="
         Push-Location $walletDirectory
         try {

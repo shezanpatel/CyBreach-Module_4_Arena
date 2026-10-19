@@ -11,6 +11,8 @@ from fastapi import (
     status,
 )
 from app.db.redis_client import get_redis_metrics, is_redis_healthy
+from app.db import SessionLocal
+from sqlalchemy import text
 from app.exceptions import RedisUnavailableError
 from app.models.schemas import (
     OptInRequest,
@@ -152,12 +154,21 @@ def reset_leaderboard(
     response_model=HealthResponse,
     summary="Service health check",
 )
-def health_check() -> HealthResponse:
-    """Return application and Redis health status."""
+async def health_check() -> HealthResponse:
+    """Return application, Redis, and benchmark database readiness."""
     redis_ok = is_redis_healthy()
+    database_ok = False
+    try:
+        async with SessionLocal() as session:
+            await session.execute(text("SELECT 1"))
+        database_ok = True
+    except Exception:
+        database_ok = False
+    ready = redis_ok and database_ok
     return HealthResponse(
-        status="healthy" if redis_ok else "degraded",
+        status="healthy" if ready else "degraded",
         redis="connected" if redis_ok else "disconnected",
+        database="connected" if database_ok else "disconnected",
         app="running",
     )
 @router.post(

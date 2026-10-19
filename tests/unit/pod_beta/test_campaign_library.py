@@ -29,6 +29,8 @@ from app.campaign.hash_checker import (
     Module1PlaybookRegistry,
 )
 from app.campaign.api import app, catalog_service
+from app.core.database import SessionLocal
+from app.core.db_models import CampaignDefinitionModel
 
 
 @pytest.fixture(autouse=True)
@@ -390,11 +392,23 @@ async def test_get_campaign_not_found():
 
 
 @pytest.mark.asyncio
-async def test_create_campaign_endpoint():
+async def test_create_campaign_endpoint(request):
     transport = ASGITransport(app=app)
+    campaign_id = "CAMP-NEW-001"
+
+    def cleanup_test_campaign():
+        catalog_service.campaigns.pop(campaign_id, None)
+        with SessionLocal() as db:
+            db.query(CampaignDefinitionModel).filter_by(campaign_id=campaign_id).delete()
+            db.commit()
+
+    # This endpoint persists definitions. Clear this test's prior run and
+    # remove its row afterward to keep repeated full-suite runs independent.
+    cleanup_test_campaign()
+    request.addfinalizer(cleanup_test_campaign)
     async with AsyncClient(transport=transport, base_url="http://test") as client:
         payload = {
-            "campaign_id": "CAMP-NEW-001",
+            "campaign_id": campaign_id,
             "title": "New Custom Campaign",
             "description": "Custom campaign creation test",
             "playbook_hashes": [
@@ -412,7 +426,7 @@ async def test_create_campaign_endpoint():
         resp = await client.post("/campaigns", json=payload)
         assert resp.status_code == 201
         data = resp.json()
-        assert data["campaign_id"] == "CAMP-NEW-001"
+        assert data["campaign_id"] == campaign_id
         assert data["content_hash"].startswith("sha256:")
 
 
@@ -443,6 +457,13 @@ async def test_boss_fight_api_workflow():
         assert s1_resp.status_code == 200
         assert s1_resp.json()["current_stage_number"] == 2
         assert s1_resp.json()["is_completed"] is False
+
+        # Simulate a fresh process cache: persisted session state must remain readable.
+        catalog_service.boss_sessions.clear()
+        resumed = await client.get(f"/campaigns/boss-fight/{session_id}")
+        assert resumed.status_code == 200
+        assert resumed.json()["current_stage_number"] == 2
+        assert resumed.json()["stage_results"]["stage-apt29-1"]["passed"] is True
 
 
 # =====================================================================

@@ -1,4 +1,4 @@
-﻿from typing import List, Optional
+from typing import List, Literal, Optional
 
 from pydantic import Field
 from pydantic_settings import BaseSettings, SettingsConfigDict
@@ -23,10 +23,10 @@ class Settings(BaseSettings):
     JWT_ALGORITHM: str = "HS256"
     JWT_AUDIENCE: Optional[str] = None
     ACCESS_TOKEN_EXPIRE_MINUTES: int = 60
-    DEV_DEMO_AUTH_ENABLED: bool = True
-    DEMO_ACCOUNT_ID: str = "manager@cybreach.demo"
-    DEMO_ACCOUNT_PASSWORD: str = "ArenaDemo2026!"
-    DEMO_STARTING_CREDITS: int = Field(default=1200, ge=0, le=10_000_000)
+    DEV_DEMO_AUTH_ENABLED: bool = False
+    DEMO_ACCOUNT_ID: Optional[str] = None
+    DEMO_ACCOUNT_PASSWORD: Optional[str] = None
+    DEMO_STARTING_CREDITS: int = Field(default=0, ge=0, le=10_000_000)
 
     POD_BETA_CAMPAIGN_URL: Optional[str] = "http://127.0.0.1:8001"
     POD_BETA_ENGAGEMENT_URL: Optional[str] = "http://127.0.0.1:8002"
@@ -36,6 +36,14 @@ class Settings(BaseSettings):
     WALLET_SERVICE_JWT_ALGORITHM: str = "HS256"
     POD_DELTA_INTERNAL_URL: Optional[str] = "http://127.0.0.1:8000"
     UPSTREAM_TIMEOUT_SECONDS: float = 5.0
+    # Optional realistic local demo paths. Both are disabled by default.
+    LAB_DEMO_ENABLED: bool = False
+    LAB_TARGET_URL: str = "http://127.0.0.1:3000"
+    LAB_TARGET_NAME: str = "OWASP Juice Shop"
+    DEMO_PAYMENT_MODE: Literal["simulated", "stripe_test"] = "simulated"
+    STRIPE_SECRET_KEY: Optional[str] = None
+    STRIPE_WEBHOOK_SECRET: Optional[str] = None
+    DEMO_FRONTEND_URL: str = "http://127.0.0.1:5173"
 
     LOG_LEVEL: str = "INFO"
 

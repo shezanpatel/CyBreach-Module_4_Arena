@@ -23,7 +23,12 @@ async def api_client():
 
 
 @pytest.fixture(autouse=True)
-def reset_demo_state():
+def reset_demo_state(monkeypatch):
+    monkeypatch.setattr(settings, "DEV_DEMO_AUTH_ENABLED", True)
+    monkeypatch.setattr(settings, "DEMO_ACCOUNT_ID", "test-manager@example.test")
+    monkeypatch.setattr(settings, "DEMO_ACCOUNT_PASSWORD", "test-only-password")
+    monkeypatch.setattr(settings, "DEMO_STARTING_CREDITS", 1200)
+    monkeypatch.setattr(settings, "LAB_DEMO_ENABLED", False)
     with arena_gateway_routes._demo_account_lock:
         arena_gateway_routes._demo_account = arena_gateway_routes._new_demo_account()
     yield
@@ -58,8 +63,8 @@ async def test_demo_auth_requires_configured_demo_credentials(api_client):
     response = await api_client.post(
         "/api/v1/auth/demo",
         json={
-            "account_id": settings.DEMO_ACCOUNT_ID,
-            "password": settings.DEMO_ACCOUNT_PASSWORD,
+            "account_id": "test-manager@example.test",
+            "password": "test-only-password",
         },
     )
 
@@ -129,8 +134,8 @@ async def test_demo_state_is_seeded_and_separate_from_live_wallet(api_client):
         "available_balance": settings.DEMO_STARTING_CREDITS,
         "currency": "CR",
     }
-    assert state["transactions"]["entries"][0]["reference_id"] == "Welcome demo credits"
-    assert state["notifications"]["total"] == 1
+    assert state["transactions"]["entries"] == []
+    assert state["notifications"]["total"] == 0
     assert state["analytics"]["source"] == "simulated_demo"
 
 
@@ -156,7 +161,7 @@ async def test_demo_top_up_simulates_payment_and_updates_ledger(api_client):
     assert result["state"]["wallet"]["available_balance"] == settings.DEMO_STARTING_CREDITS + 750
     assert result["state"]["transactions"]["entries"][0]["entry_type"] == "credit"
     assert result["state"]["receipts"]["total"] == 1
-    assert result["state"]["notifications"]["total"] == 2
+    assert result["state"]["notifications"]["total"] == 1
 
 
 async def test_demo_checkout_replay_does_not_credit_wallet_twice(api_client):
@@ -195,9 +200,9 @@ async def test_demo_engagement_debits_demo_credits_and_returns_fake_findings(api
         "/api/v1/arena/demo/engagements",
         headers={"Authorization": f"Bearer {_token('demo')}"},
         json={
-            "campaign_id": "vulnerability-scan",
+            "campaign_id": "vuln",
             "campaign_title": "Vulnerability Scan",
-            "credit_cost": 100,
+            "credit_cost": 5,
         },
     )
 
@@ -206,25 +211,26 @@ async def test_demo_engagement_debits_demo_credits_and_returns_fake_findings(api
     assert result["engagement"]["status"] == "simulated_completed"
     assert result["engagement"]["finding_count"] > 0
     assert "No targets were contacted" in result["engagement"]["notice"]
-    assert result["state"]["wallet"]["available_balance"] == settings.DEMO_STARTING_CREDITS - 100
+    assert result["state"]["wallet"]["available_balance"] == settings.DEMO_STARTING_CREDITS - 5
     assert result["state"]["transactions"]["entries"][0]["entry_type"] == "debit"
     assert result["state"]["analytics"]["total_engagements"] == 1
-    assert result["state"]["notifications"]["total"] == 2
+    assert result["state"]["notifications"]["total"] == 1
 
 
 async def test_demo_engagement_rejects_insufficient_balance(api_client):
+    arena_gateway_routes._demo_account["balance"] = 10
     response = await api_client.post(
         "/api/v1/arena/demo/engagements",
         headers={"Authorization": f"Bearer {_token('demo')}"},
         json={
-            "campaign_id": "big-scan",
-            "campaign_title": "Large scan",
-            "credit_cost": settings.DEMO_STARTING_CREDITS + 1,
+            "campaign_id": "malware",
+            "campaign_title": "Malware Analysis",
+            "credit_cost": 20,
         },
     )
 
     assert response.status_code == 402
-    assert arena_gateway_routes._demo_snapshot()["wallet"]["available_balance"] == settings.DEMO_STARTING_CREDITS
+    assert arena_gateway_routes._demo_snapshot()["wallet"]["available_balance"] == 10
 
 
 async def test_demo_reset_restores_starting_state(api_client):
@@ -243,7 +249,7 @@ async def test_demo_reset_restores_starting_state(api_client):
 
     assert response.status_code == 200
     assert response.json()["wallet"]["available_balance"] == settings.DEMO_STARTING_CREDITS
-    assert response.json()["transactions"]["total"] == 1
+    assert response.json()["transactions"]["total"] == 0
     assert response.json()["receipts"]["total"] == 0
 
 
@@ -300,6 +306,111 @@ async def test_wallet_proxy_requires_server_side_delegation_secret(api_client, m
 
     assert response.status_code == 503
     assert response.json()["error"]["message"] == "Wallet service delegation secret is not configured"
+
+
+async def test_wallet_history_proxy_forwards_audit_filters(api_client, monkeypatch):
+    captured = {}
+
+    async def fake_proxy(**kwargs):
+        captured.update(kwargs)
+        return arena_gateway_routes.Response(
+            content=b'{"total":0,"limit":25,"offset":0,"entries":[]}',
+            media_type="application/json",
+        )
+
+    monkeypatch.setattr(settings, "WALLET_SERVICE_URL", "http://wallet.test")
+    monkeypatch.setattr(settings, "WALLET_SERVICE_JWT_SECRET", "wallet-delegation-test-secret")
+    monkeypatch.setattr(arena_gateway_routes, "_proxy", fake_proxy)
+
+    response = await api_client.get(
+        "/api/v1/arena/wallet/history",
+        params={
+            "tenant_id": "tenant-42",
+            "date_from": "2026-10-01T00:00:00Z",
+            "date_to": "2026-10-15T23:59:59Z",
+            "entry_type": "CREDIT",
+            "module_source": "mod4",
+            "limit": 25,
+            "offset": 50,
+        },
+        headers={"Authorization": f"Bearer {_token('admin')}"},
+    )
+
+    assert response.status_code == 200
+    assert captured["base_url"] == "http://wallet.test"
+    assert captured["path"] == "/wallet/history/tenant-42"
+    assert captured["params"]["entry_type"] == "CREDIT"
+    assert captured["params"]["module_source"] == "mod4"
+    assert captured["params"]["limit"] == 25
+    assert captured["params"]["offset"] == 50
+    assert captured["params"]["date_from"].isoformat().startswith("2026-10-01T00:00:00")
+    assert captured["params"]["date_to"].isoformat().startswith("2026-10-15T23:59:59")
+    delegated = captured["authorization"].removeprefix("Bearer ")
+    claims = jwt.decode(
+        delegated,
+        "wallet-delegation-test-secret",
+        algorithms=[settings.WALLET_SERVICE_JWT_ALGORITHM],
+    )
+    assert claims["sub"] == "1"
+    assert claims["tenant_id"] == "1"
+    assert claims["role"] == "admin"
+
+
+async def test_wallet_history_rejects_cross_tenant_user_queries(api_client, monkeypatch):
+    response = await api_client.get(
+        "/api/v1/arena/wallet/history",
+        params={"tenant_id": "tenant-42"},
+        headers={"Authorization": f"Bearer {_token('user')}"},
+    )
+
+    assert response.status_code == 403
+
+
+async def test_wallet_audit_export_rejects_cross_tenant_user_queries(api_client, monkeypatch):
+    response = await api_client.get(
+        "/api/v1/arena/wallet/history/export",
+        params={"tenant_id": "tenant-42"},
+        headers={"Authorization": f"Bearer {_token('user')}"},
+    )
+
+    assert response.status_code == 403
+
+
+async def test_wallet_audit_export_proxies_csv_for_authenticated_user(api_client, monkeypatch):
+    captured = {}
+
+    async def fake_proxy(**kwargs):
+        captured.update(kwargs)
+        return arena_gateway_routes.Response(
+            content=b"entry_type,amount\nCREDIT,5.00\n",
+            media_type="text/csv",
+        )
+
+    monkeypatch.setattr(settings, "WALLET_SERVICE_URL", "http://wallet.test")
+    monkeypatch.setattr(settings, "WALLET_SERVICE_JWT_SECRET", "wallet-delegation-test-secret")
+    monkeypatch.setattr(arena_gateway_routes, "_proxy", fake_proxy)
+
+    response = await api_client.get(
+        "/api/v1/arena/wallet/history/export",
+        params={"tenant_id": "tenant-42", "entry_type": "CREDIT", "module_source": "mod4"},
+        headers={"Authorization": f"Bearer {_token('admin')}"},
+    )
+
+    assert response.status_code == 200
+    assert response.headers["content-type"].startswith("text/csv")
+    assert response.headers["content-disposition"] == 'attachment; filename="pod-alpha-wallet-audit.csv"'
+    assert response.text.startswith("entry_type,amount")
+    assert captured["path"] == "/wallet/history/tenant-42/export"
+    assert captured["params"] == {"entry_type": "CREDIT", "module_source": "mod4"}
+
+
+async def test_demo_identity_cannot_export_live_wallet_audit(api_client):
+    response = await api_client.get(
+        "/api/v1/arena/wallet/history/export",
+        headers={"Authorization": f"Bearer {_token('demo')}"},
+    )
+
+    assert response.status_code == 403
 
 
 def test_wallet_delegation_scopes_token_to_subject_wallet(monkeypatch):

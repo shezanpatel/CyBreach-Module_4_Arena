@@ -21,8 +21,7 @@ router = APIRouter(
 # PG-27
 MIN_PEER_GROUP_SIZE = 10
 
-# Section 2 / Section 11.7
-DEMO_DATA_LABEL = "seeded synthetic demo baseline - no real/private peer data"
+BENCHMARK_DATA_LABEL = "Seeded demo data (synthetic)"
 
 
 # ============================================================
@@ -59,8 +58,7 @@ class BenchmarkResult(BaseModel):
     """
     Flat BenchmarkResult contract required by Pod Delta.
 
-    Synthetic benchmark data is explicitly labelled as
-    demo-only and not derived from real or private peer data.
+    The response only contains aggregates loaded from the benchmark database.
     """
 
     tenant_id: str
@@ -70,7 +68,7 @@ class BenchmarkResult(BaseModel):
     peer_75th: float
     peer_count: int
     trend: list
-    label: str = DEMO_DATA_LABEL
+    label: str = BENCHMARK_DATA_LABEL
 
 
 class RegionalComparisonResponse(BaseModel):
@@ -85,7 +83,7 @@ class RegionalComparisonResponse(BaseModel):
     global_median: float
 
     median_difference: float
-    label: str = DEMO_DATA_LABEL
+    label: str = BENCHMARK_DATA_LABEL
 
 
 class BenchmarkTrendItem(BaseModel):
@@ -98,7 +96,7 @@ class BenchmarkTrendItem(BaseModel):
 class BenchmarkTrendResponse(BaseModel):
     tenant_id: str
     trend: list[BenchmarkTrendItem]
-    label: str = DEMO_DATA_LABEL
+    label: str = BENCHMARK_DATA_LABEL
 
 
 class BenchmarkCohort(BaseModel):
@@ -111,6 +109,7 @@ class BenchmarkCohort(BaseModel):
 class BenchmarkCohortsResponse(BaseModel):
     minimum_peer_count: int
     cohorts: list[BenchmarkCohort]
+    label: str = BENCHMARK_DATA_LABEL
 
 
 # ============================================================
@@ -129,7 +128,7 @@ class BenchmarkCohortsResponse(BaseModel):
 #   |
 #   |
 #   v
-# Flat, explicitly labelled synthetic demo result
+# Flat result from the persisted benchmark aggregate
 # ============================================================
 
 @router.get(
@@ -141,6 +140,7 @@ async def list_benchmark_cohorts() -> BenchmarkCohortsResponse:
     return BenchmarkCohortsResponse(
         minimum_peer_count=MIN_PEER_GROUP_SIZE,
         cohorts=cohorts,
+        label=BENCHMARK_DATA_LABEL,
     )
 
 
@@ -196,34 +196,24 @@ async def create_benchmark(
         )
 
     # --------------------------------------------------------
-    # Step 4: Build flat BenchmarkResult
-    #
-    # The current repository contains seeded synthetic
-    # aggregates, not real or private peer data. Return the
-    # stored values exactly and label the result accordingly.
-    #
-    # Therefore:
-    # - tenant_id identifies the seeded demo cohort
-    # - percentile is the position of the cohort median
-    # - trend starts empty because historical trend is exposed
-    #   separately through /benchmark/trend/{tenant_id}
+    # Build the result from the persisted cohort aggregate.
     # --------------------------------------------------------
 
-    demo_tenant_id = (
+    cohort_id = (
         f"{peer['industry']}-"
         f"{peer['region']}-"
         f"{peer['size_band']}"
     )
 
     return BenchmarkResult(
-        tenant_id=demo_tenant_id,
+        tenant_id=cohort_id,
         percentile=50.0,
         peer_median=float(peer["peer_median"]),
         peer_25th=float(peer["peer_25th"]),
         peer_75th=float(peer["peer_75th"]),
         peer_count=peer_count,
         trend=[],
-        label=DEMO_DATA_LABEL,
+        label=BENCHMARK_DATA_LABEL,
     )
 
 
@@ -364,7 +354,7 @@ async def compare_regional_benchmark(
         global_peer_count=global_peer_count,
         global_median=global_median,
         median_difference=median_difference,
-        label=DEMO_DATA_LABEL,
+        label=BENCHMARK_DATA_LABEL,
     )
 
 
@@ -478,5 +468,5 @@ async def get_benchmark_trend(
     return BenchmarkTrendResponse(
         tenant_id=tenant_id,
         trend=trend,
-        label=DEMO_DATA_LABEL,
+        label=BENCHMARK_DATA_LABEL,
     )

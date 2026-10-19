@@ -106,9 +106,9 @@ class TestRevalidationFlow:
         bal_after = await wallet.get_balance("tenant_high")
         assert bal_after == 172
 
-        # Verify idempotency key format: mod4:{reval_id}
+        # Verify tenant-scoped Module 4 idempotency key.
         entries = wallet.get_entries("tenant_high")
-        reval_entry = [e for e in entries if e.idempotency_key == f"mod4:{reval_id}"]
+        reval_entry = [e for e in entries if e.idempotency_key == f"mod4:tenant_high:{reval_id}:debit"]
         assert len(reval_entry) == 1
         assert reval_entry[0].amount == 3
 

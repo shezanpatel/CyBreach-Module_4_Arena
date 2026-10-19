@@ -4,6 +4,10 @@ from __future__ import annotations
 
 import asyncio
 import copy
+import hashlib
+import hmac
+import json
+import time
 import ipaddress
 import secrets
 import threading
@@ -20,6 +24,7 @@ from pydantic import BaseModel, ConfigDict, Field
 
 from app.core.security import AuthenticatedPrincipal, get_current_principal
 from app.core.settings import settings
+from app.services.local_lab import LabDemoError, run_local_header_baseline
 
 router = APIRouter(prefix="/api/v1/arena", tags=["Arena Gateway"])
 auth_router = APIRouter(prefix="/api/v1/auth", tags=["Authentication"])
@@ -39,7 +44,7 @@ class DemoCredentials(BaseModel):
 
 class DemoTopUpRequest(BaseModel):
     package_id: Literal["starter", "operator", "enterprise"]
-    payment_method: Literal["demo_card", "demo_upi"]
+    payment_method: Literal["demo_card", "demo_upi", "demo_bank"]
     checkout_id: UUID
     customer_name: str = Field(min_length=2, max_length=120)
     customer_email: str = Field(
@@ -51,6 +56,21 @@ class DemoTopUpRequest(BaseModel):
 
     model_config = ConfigDict(str_strip_whitespace=True)
 
+
+class DemoRefundRequest(BaseModel):
+    receipt_number: str = Field(min_length=1, max_length=80)
+
+    model_config = ConfigDict(str_strip_whitespace=True)
+
+
+class StripeCheckoutRequest(BaseModel):
+    package_id: Literal["starter", "operator", "enterprise"]
+    checkout_id: UUID
+    customer_email: str = Field(
+        min_length=5,
+        max_length=254,
+        pattern=r"^[^@\s]+@[^@\s]+\.[^@\s]+$",
+    )
 
 class DemoEngagementRequest(BaseModel):
     campaign_id: str = Field(min_length=1, max_length=100)
@@ -147,37 +167,41 @@ def _is_loopback(host: str | None) -> bool:
 
 
 def _new_demo_account() -> dict[str, Any]:
-    now = datetime.now(timezone.utc)
     return {
         "balance": settings.DEMO_STARTING_CREDITS,
-        "total_visits": 128,
+        "total_visits": 0,
+        "engagements": [],
+        "receipts": [],
+        "checkouts": {},
+        "transactions": [],
+        "notifications": [],
+    }
+
+
+def _new_preview_account() -> dict[str, Any]:
+    """In-memory fictional activity shown only by the loopback preview token."""
+    now = datetime.now(timezone.utc)
+    return {
+        "balance": 1175,
+        "total_visits": 24,
+        # Do not advertise a completed report until an engagement has actually run.
         "engagements": [],
         "receipts": [],
         "checkouts": {},
         "transactions": [
-            {
-                "id": "demo-seed-1",
-                "entry_type": "credit",
-                "amount": settings.DEMO_STARTING_CREDITS,
-                "currency": "CR",
-                "reference_id": "Welcome demo credits",
-                "created_at": now.isoformat(),
-            }
+            {"id": "PREVIEW-TXN-003", "entry_type": "debit", "amount": 75, "currency": "CR", "reference_id": "Sample campaign activity", "created_at": (now - timedelta(hours=6)).isoformat()},
+            {"id": "PREVIEW-TXN-002", "entry_type": "credit", "amount": 250, "currency": "CR", "reference_id": "Sample credit allocation", "created_at": (now - timedelta(days=2)).isoformat()},
+            {"id": "PREVIEW-TXN-001", "entry_type": "credit", "amount": 1000, "currency": "CR", "reference_id": "Sample opening balance", "created_at": (now - timedelta(days=7)).isoformat()},
         ],
         "notifications": [
-            {
-                "id": "demo-welcome",
-                "title": "Demo account ready",
-                "message": "Explore the Arena. Wallet, payments, and scan results are simulated.",
-                "channel": "in-app",
-                "status": "delivered",
-                "created_at": now.isoformat(),
-            }
+            {"id": "PREVIEW-NOTICE-002", "title": "Sample campaign completed", "message": "Preview activity only. No security scan was performed.", "channel": "in-app", "status": "delivered", "created_at": (now - timedelta(hours=6)).isoformat()},
+            {"id": "PREVIEW-NOTICE-001", "title": "Sample wallet update", "message": "Fictional preview balance and activity; no Alpha ledger was changed.", "channel": "in-app", "status": "delivered", "created_at": (now - timedelta(days=2)).isoformat()},
         ],
     }
 
 
 _demo_account = _new_demo_account()
+_preview_account_initialized = False
 
 
 def _require_local_demo(
@@ -277,11 +301,11 @@ def create_local_demo_token(
     if (
         not secrets.compare_digest(
             payload.account_id.strip().casefold(),
-            settings.DEMO_ACCOUNT_ID.strip().casefold(),
+            (settings.DEMO_ACCOUNT_ID or "").strip().casefold(),
         )
         or not secrets.compare_digest(
             payload.password,
-            settings.DEMO_ACCOUNT_PASSWORD,
+            settings.DEMO_ACCOUNT_PASSWORD or "",
         )
     ):
         raise HTTPException(
@@ -311,7 +335,51 @@ def create_local_demo_token(
         "tenant_id": "demo-tenant",
         "subject": "1",
         "mode": "development_demo",
+        "payment_mode": settings.DEMO_PAYMENT_MODE,
+        "lab_demo_enabled": settings.LAB_DEMO_ENABLED,
+        "lab_target_name": settings.LAB_TARGET_NAME,
         "display_name": "Arena Demo Manager",
+    }
+
+
+@auth_router.post("/preview")
+def create_local_preview_token(request: Request) -> dict[str, Any]:
+    """Issue a fictional preview identity only on an explicitly enabled local dev server."""
+    global _demo_account, _preview_account_initialized
+    if (
+        settings.ENVIRONMENT.lower() != "development"
+        or not settings.DEV_DEMO_AUTH_ENABLED
+        or not _is_loopback(request.client.host if request.client else None)
+    ):
+        raise HTTPException(status_code=404, detail="Local preview is unavailable")
+
+    now = datetime.now(timezone.utc)
+    expires = now + timedelta(minutes=settings.ACCESS_TOKEN_EXPIRE_MINUTES)
+    token = jwt.encode(
+        {
+            "sub": "preview-user-001",
+            "tenant_id": "preview-tenant",
+            "role": "demo",
+            "name": "Sample Preview Account",
+            "iat": now,
+            "exp": expires,
+        },
+        settings.SECRET_KEY,
+        algorithm=settings.JWT_ALGORITHM,
+    )
+    # Seed the sample account on its first preview login, then retain its latest
+    # engagement and results when the user signs out and back in.
+    with _demo_account_lock:
+        if not _preview_account_initialized:
+            _demo_account = _new_preview_account()
+            _preview_account_initialized = True
+    return {
+        "access_token": token,
+        "token_type": "bearer",
+        "expires_in": settings.ACCESS_TOKEN_EXPIRE_MINUTES * 60,
+        "mode": "sample_preview",
+        "lab_demo_enabled": settings.LAB_DEMO_ENABLED,
+        "lab_target_name": settings.LAB_TARGET_NAME,
     }
 
 
@@ -321,7 +389,7 @@ async def get_connections(
 ) -> dict[str, Any]:
     probes = (
         ("pod_delta", settings.POD_DELTA_INTERNAL_URL, "/api/v1/integration/health"),
-        ("pod_beta_campaigns", settings.POD_BETA_CAMPAIGN_URL, "/campaigns?limit=1"),
+        ("pod_beta_campaigns", settings.POD_BETA_CAMPAIGN_URL, "/openapi.json"),
         ("pod_beta_engagements", settings.POD_BETA_ENGAGEMENT_URL, "/openapi.json"),
         ("pod_gamma", settings.POD_GAMMA_URL, "/health"),
         ("wallet_service", settings.WALLET_SERVICE_URL, "/"),
@@ -339,14 +407,318 @@ async def get_connections(
     }
 
 
+@router.get("/public-status")
+async def get_public_service_status() -> dict[str, Any]:
+    """Expose only upstream reachability so the public dashboard can render safely."""
+    probes = (
+        ("pod_delta", settings.POD_DELTA_INTERNAL_URL, "/api/v1/integration/health"),
+        ("pod_beta_campaigns", settings.POD_BETA_CAMPAIGN_URL, "/openapi.json"),
+        ("pod_beta_engagements", settings.POD_BETA_ENGAGEMENT_URL, "/openapi.json"),
+        ("pod_gamma", settings.POD_GAMMA_URL, "/health"),
+        ("wallet_service", settings.WALLET_SERVICE_URL, "/"),
+    )
+    async with httpx.AsyncClient(timeout=settings.UPSTREAM_TIMEOUT_SECONDS) as client:
+        services = await asyncio.gather(
+            *(_probe(client, name, url, path) for name, url, path in probes)
+        )
+    return {
+        "scope": "service_reachability_only",
+        "services": services,
+        "checked_at": datetime.now(timezone.utc).isoformat(),
+    }
+
+
 @router.get("/demo/state")
-def get_demo_state(
+async def get_demo_state(
     request: Request,
     principal: AuthenticatedPrincipal = Depends(get_current_principal),
 ) -> dict[str, Any]:
     _require_local_demo(request, principal)
-    return _demo_snapshot()
+    snapshot = _demo_snapshot()
+    if settings.LAB_DEMO_ENABLED and not any(
+        item.get("status") == "lab_assessed" for item in snapshot["engagements"]
+    ):
+        beta_url = _base_url(
+            settings.POD_BETA_ENGAGEMENT_URL,
+            "Pod Beta engagement API",
+        )
+        try:
+            async with httpx.AsyncClient(timeout=5.0, trust_env=False) as client:
+                response = await client.get(
+                    f"{beta_url}/engagement",
+                    headers={"Authorization": request.headers.get("authorization", "")},
+                )
+                response.raise_for_status()
+                saved_engagements = response.json()
+        except (httpx.HTTPError, ValueError):
+            saved_engagements = []
 
+        saved = next(
+            (
+                item
+                for item in saved_engagements
+                if item.get("state") in {"completed", "archived"}
+                and item.get("metadata", {}).get("source") == "local_lab_demo"
+                and isinstance(item.get("report"), dict)
+            ),
+            None,
+        )
+        if saved:
+            report = saved["report"]
+            technique_results = report.get("technique_results", [])
+            results = []
+            for index, outcome in enumerate(technique_results):
+                verdict = str(outcome.get("verdict", "NoData"))
+                normalized = verdict.casefold()
+                result_status = (
+                    "passed" if normalized == "detected"
+                    else "finding" if normalized in {"missed", "partial"}
+                    else "inconclusive"
+                )
+                results.append({
+                    "id": f"{saved['engagement_id']}-result-{index + 1}",
+                    "status": result_status,
+                    "title": outcome.get("technique_id", "Security validation result"),
+                    "evidence": outcome.get("evidence_ref") or outcome.get("notes"),
+                })
+            summary = report.get("executive_summary", {})
+            scope = saved.get("scope", {})
+            assets = scope.get("assets", []) if isinstance(scope, dict) else []
+            target_name = (
+                saved.get("metadata", {}).get("target_name")
+                or scope.get("metadata", {}).get("target_name", "Local lab")
+            )
+            restored = {
+                "id": saved["engagement_id"],
+                "status": "lab_assessed",
+                "campaign_id": "vuln",
+                "campaign_title": f"{target_name} header baseline",
+                "credit_cost": 5,
+                "finding_count": int(summary.get("missed", 0)) + int(summary.get("partial", 0)),
+                "results": results,
+                "completed_at": saved.get("completed_at"),
+                "target": assets[0] if assets else "Local loopback lab",
+                "target_name": target_name,
+                "http_status": saved.get("metadata", {}).get(
+                    "http_status", "Not retained by Pod Beta"
+                ),
+                "beta_report": report,
+                "notice": "Restored from the tenant-scoped completed report stored by Pod Beta.",
+            }
+            with _demo_account_lock:
+                if not any(
+                    item.get("id") == restored["id"]
+                    for item in _demo_account["engagements"]
+                ):
+                    _demo_account["engagements"].insert(0, restored)
+                    _demo_account["balance"] = max(0, _demo_account["balance"] - 5)
+                    _demo_account["transactions"].insert(0, {
+                        "id": f"{restored['id']}-debit",
+                        "entry_type": "debit",
+                        "amount": 5,
+                        "currency": "CR",
+                        "reference_id": f"{restored['campaign_title']} - local lab",
+                        "created_at": restored["completed_at"] or datetime.now(timezone.utc).isoformat(),
+                    })
+            snapshot = _demo_snapshot()
+    return snapshot
+
+
+@router.post("/demo/top-up/stripe-checkout")
+async def create_stripe_test_checkout(
+    payload: StripeCheckoutRequest,
+    request: Request,
+    principal: AuthenticatedPrincipal = Depends(get_current_principal),
+) -> dict[str, Any]:
+    _require_local_demo(request, principal)
+    if settings.DEMO_PAYMENT_MODE != "stripe_test":
+        raise HTTPException(status_code=409, detail="Stripe test checkout is not enabled")
+    if not settings.STRIPE_SECRET_KEY or not settings.STRIPE_SECRET_KEY.startswith("sk_test_"):
+        raise HTTPException(status_code=503, detail="A Stripe test-mode secret key is not configured")
+    if not settings.STRIPE_WEBHOOK_SECRET:
+        raise HTTPException(status_code=503, detail="The Stripe webhook signing secret is not configured")
+
+    package = DEMO_PACKAGES[payload.package_id]
+    checkout_key = str(payload.checkout_id)
+    with _demo_account_lock:
+        existing = _demo_account["checkouts"].get(checkout_key)
+        if existing:
+            raise HTTPException(status_code=409, detail="This checkout has already been completed")
+
+    signature = hmac.new(
+        settings.SECRET_KEY.encode("utf-8"),
+        f"{checkout_key}:{principal.subject}:{principal.tenant_id}:{payload.package_id}".encode("utf-8"),
+        hashlib.sha256,
+    ).hexdigest()
+    frontend = settings.DEMO_FRONTEND_URL.rstrip("/")
+    form = {
+        "mode": "payment",
+        "success_url": f"{frontend}/?payment=success&session_id={{CHECKOUT_SESSION_ID}}",
+        "cancel_url": f"{frontend}/?payment=cancelled",
+        "customer_email": payload.customer_email,
+        "customer_creation": "always",
+        "billing_address_collection": "required",
+        "client_reference_id": principal.subject,
+        "metadata[checkout_id]": checkout_key,
+        "metadata[package_id]": payload.package_id,
+        "metadata[tenant_id]": principal.tenant_id,
+        "metadata[subject]": principal.subject,
+        "metadata[request_signature]": signature,
+        "line_items[0][price_data][currency]": "usd",
+        "line_items[0][price_data][unit_amount]": str(round(package["demo_amount"] * 100)),
+        "line_items[0][price_data][product_data][name]": f"{package['label']} (Arena test credits)",
+        "line_items[0][quantity]": "1",
+    }
+    try:
+        async with httpx.AsyncClient(timeout=15.0, trust_env=False) as client:
+            response = await client.post(
+                "https://api.stripe.com/v1/checkout/sessions",
+                data=form,
+                auth=(settings.STRIPE_SECRET_KEY, ""),
+                headers={"Idempotency-Key": f"arena-demo-{checkout_key}"},
+            )
+        response.raise_for_status()
+        checkout = response.json()
+    except (httpx.RequestError, httpx.HTTPStatusError, ValueError) as exc:
+        raise HTTPException(
+            status_code=status.HTTP_502_BAD_GATEWAY,
+            detail="Stripe test checkout could not be created",
+        ) from exc
+
+    if checkout.get("livemode") is not False or not checkout.get("url"):
+        raise HTTPException(
+            status_code=status.HTTP_502_BAD_GATEWAY,
+            detail="Stripe did not return a valid test-mode checkout session",
+        )
+    return {"checkout_url": checkout["url"], "checkout_id": checkout.get("id")}
+
+
+@router.post("/demo/stripe-webhook")
+async def receive_stripe_test_webhook(request: Request) -> dict[str, bool]:
+    secret = settings.STRIPE_WEBHOOK_SECRET
+    if not secret:
+        raise HTTPException(status_code=404, detail="Stripe webhook is not enabled")
+
+    raw_body = await request.body()
+    signature_header = request.headers.get("stripe-signature", "")
+    parts: dict[str, list[str]] = {}
+    for part in signature_header.split(","):
+        key, separator, value = part.partition("=")
+        if separator:
+            parts.setdefault(key, []).append(value)
+    try:
+        timestamp = int(parts.get("t", [""])[0])
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail="Invalid Stripe signature") from exc
+    if abs(time.time() - timestamp) > 300:
+        raise HTTPException(status_code=400, detail="Expired Stripe signature")
+    signed_payload = str(timestamp).encode("ascii") + b"." + raw_body
+    expected_signature = hmac.new(secret.encode("utf-8"), signed_payload, hashlib.sha256).hexdigest()
+    if not any(hmac.compare_digest(expected_signature, value) for value in parts.get("v1", [])):
+        raise HTTPException(status_code=400, detail="Invalid Stripe signature")
+    try:
+        event = json.loads(raw_body)
+    except (json.JSONDecodeError, UnicodeDecodeError) as exc:
+        raise HTTPException(status_code=400, detail="Invalid Stripe event payload") from exc
+
+    if event.get("type") != "checkout.session.completed":
+        return {"received": True}
+    checkout = (event.get("data") or {}).get("object") or {}
+    metadata = checkout.get("metadata") or {}
+    package_id = metadata.get("package_id")
+    checkout_key = metadata.get("checkout_id")
+    package = DEMO_PACKAGES.get(package_id)
+    subject = metadata.get("subject", "")
+    tenant_id = metadata.get("tenant_id", "")
+    expected_request_signature = hmac.new(
+        settings.SECRET_KEY.encode("utf-8"),
+        f"{checkout_key}:{subject}:{tenant_id}:{package_id}".encode("utf-8"),
+        hashlib.sha256,
+    ).hexdigest()
+    if (
+        checkout.get("livemode") is not False
+        or checkout.get("mode") != "payment"
+        or checkout.get("payment_status") != "paid"
+        or checkout.get("status") != "complete"
+        or checkout.get("client_reference_id") != subject
+        or tenant_id != "demo-tenant"
+        or not package
+        or not checkout_key
+        or not hmac.compare_digest(expected_request_signature, metadata.get("request_signature", ""))
+        or checkout.get("currency") != "usd"
+        or checkout.get("amount_total") != round(package["demo_amount"] * 100)
+    ):
+        raise HTTPException(status_code=400, detail="Stripe event does not match a valid Arena test checkout")
+
+    try:
+        UUID(checkout_key)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail="Invalid checkout reference") from exc
+
+    with _demo_account_lock:
+        if checkout_key in _demo_account["checkouts"]:
+            return {"received": True}
+        customer = checkout.get("customer_details") or {}
+        address = customer.get("address") or {}
+        billing_address = ", ".join(
+            part for part in (
+                address.get("line1"), address.get("line2"), address.get("city"),
+                address.get("state"), address.get("postal_code"), address.get("country"),
+            ) if part
+        )
+        issued_at = datetime.now(timezone.utc).isoformat()
+        receipt_number = f"TEST-{uuid4().hex[:12].upper()}"
+        amount = package["demo_amount"]
+        receipt = {
+            "id": receipt_number,
+            "receipt_number": receipt_number,
+            "status": "test_mode_paid",
+            "issued_at": issued_at,
+            "customer": {
+                "name": customer.get("name") or "Arena Demo Manager",
+                "email": customer.get("email") or "",
+                "billing_address": billing_address,
+            },
+            "payment": {
+                "method": "stripe_test_checkout",
+                "method_label": "Stripe Checkout (test mode)",
+                "reference": checkout.get("id", receipt_number),
+                "amount": amount,
+                "currency": "USD",
+            },
+            "line_items": [{
+                "description": package["label"],
+                "quantity": 1,
+                "credits": package["credits"],
+                "amount": amount,
+            }],
+            "subtotal": amount,
+            "tax": 0.0,
+            "total": amount,
+            "currency": "USD",
+            "credits_added": package["credits"],
+            "notice": "Stripe test-mode payment confirmed. No live funds moved. Demo credits are held in local memory.",
+        }
+        _demo_account["balance"] += package["credits"]
+        _demo_account["transactions"].insert(0, {
+            "id": receipt_number,
+            "entry_type": "credit",
+            "amount": package["credits"],
+            "currency": "CR",
+            "reference_id": f"{package['label']} · {receipt_number}",
+            "created_at": issued_at,
+        })
+        _demo_account["receipts"].insert(0, receipt)
+        _demo_account["checkouts"][checkout_key] = receipt
+        _demo_account["notifications"].insert(0, {
+            "id": f"demo-notification-{len(_demo_account['notifications']) + 1}",
+            "title": "Stripe test payment confirmed",
+            "message": f"{package['credits']} demo credits were added. No live funds moved.",
+            "channel": "in-app",
+            "status": "delivered",
+            "created_at": issued_at,
+        })
+    return {"received": True}
 
 @router.post("/demo/top-up")
 def demo_top_up(
@@ -355,6 +727,8 @@ def demo_top_up(
     principal: AuthenticatedPrincipal = Depends(get_current_principal),
 ) -> dict[str, Any]:
     _require_local_demo(request, principal)
+    if settings.DEMO_PAYMENT_MODE == "stripe_test":
+        raise HTTPException(status_code=409, detail="Use the configured Stripe test checkout")
     package = DEMO_PACKAGES[payload.package_id]
     now = datetime.now(timezone.utc).isoformat()
     checkout_key = str(payload.checkout_id)
@@ -372,11 +746,11 @@ def demo_top_up(
 
         receipt_number = f"DEMO-{uuid4().hex[:12].upper()}"
         amount = round(package["demo_amount"], 2)
-        method_label = (
-            "Demo card · ending 4242"
-            if payload.payment_method == "demo_card"
-            else "Demo UPI · demo@arena.test"
-        )
+        method_label = {
+            "demo_card": "Simulated card",
+            "demo_upi": "Demo UPI · demo@arena.test",
+            "demo_bank": "Simulated bank transfer",
+        }[payload.payment_method]
         receipt = {
             "id": receipt_number,
             "receipt_number": receipt_number,
@@ -448,13 +822,171 @@ def demo_top_up(
     }
 
 
+@router.post("/demo/refunds")
+def refund_demo_top_up(
+    payload: DemoRefundRequest,
+    request: Request,
+    principal: AuthenticatedPrincipal = Depends(get_current_principal),
+) -> dict[str, Any]:
+    """Simulate refunding a sample purchase and reversing its sample credits."""
+    _require_local_demo(request, principal)
+    with _demo_account_lock:
+        receipt = next(
+            (item for item in _demo_account["receipts"] if item["receipt_number"] == payload.receipt_number),
+            None,
+        )
+        if receipt is None:
+            raise HTTPException(status_code=404, detail="Sample payment receipt not found")
+        if receipt.get("refund"):
+            return {
+                "refunded": True,
+                "already_refunded": True,
+                "receipt": copy.deepcopy(receipt),
+                "state": _demo_snapshot(),
+            }
+
+        credits = int(receipt.get("credits_added", 0))
+        if credits <= 0:
+            raise HTTPException(status_code=409, detail="Receipt does not contain refundable sample credits")
+        if _demo_account["balance"] < credits:
+            raise HTTPException(
+                status_code=409,
+                detail="These sample credits have already been spent. The preview balance must cover the credit reversal before refunding.",
+            )
+
+        refunded_at = datetime.now(timezone.utc).isoformat()
+        refund_reference = f"REF-{uuid4().hex[:12].upper()}"
+        amount = float(receipt.get("total", receipt.get("payment", {}).get("amount", 0)))
+        currency = receipt.get("currency", "USD")
+        receipt["status"] = "simulated_refunded"
+        receipt["notice"] = "Simulated refund completed. No real payment was charged or refunded. Sample credits were reversed."
+        receipt["refund"] = {
+            "status": "simulated_success",
+            "reference": refund_reference,
+            "amount": amount,
+            "currency": currency,
+            "credits_reversed": credits,
+            "refunded_at": refunded_at,
+            "method_label": receipt.get("payment", {}).get("method_label", "Sample payment method"),
+        }
+        _demo_account["balance"] -= credits
+        _demo_account["transactions"].insert(0, {
+            "id": refund_reference,
+            "entry_type": "refund",
+            "amount": credits,
+            "currency": "CR",
+            "reference_id": f"Refund for {receipt['receipt_number']}",
+            "created_at": refunded_at,
+        })
+        _demo_account["notifications"].insert(0, {
+            "id": refund_reference,
+            "title": "Sample payment refunded",
+            "message": f"{amount:.2f} {currency} simulated refund; {credits} sample credits reversed. No real payment was refunded.",
+            "channel": "in-app",
+            "status": "delivered",
+            "created_at": refunded_at,
+        })
+
+        return {
+            "refunded": True,
+            "already_refunded": False,
+            "receipt": copy.deepcopy(receipt),
+            "state": _demo_snapshot(),
+        }
+
+
 @router.post("/demo/engagements")
-def run_demo_engagement(
+async def run_demo_engagement(
     payload: DemoEngagementRequest,
     request: Request,
     principal: AuthenticatedPrincipal = Depends(get_current_principal),
 ) -> dict[str, Any]:
     _require_local_demo(request, principal)
+    expected_costs = {"vuln": 5, "malware": 20, "threat": 25, "compliance": 20}
+    if payload.campaign_id not in expected_costs or payload.credit_cost != expected_costs[payload.campaign_id]:
+        raise HTTPException(status_code=400, detail="Invalid demo campaign or credit cost")
+
+    if settings.LAB_DEMO_ENABLED:
+        if payload.campaign_id != "vuln":
+            raise HTTPException(status_code=400, detail="Only the Vulnerability Scan card is wired to the local lab baseline")
+        beta_url = _base_url(settings.POD_BETA_ENGAGEMENT_URL, "Pod Beta engagement API")
+        with _demo_account_lock:
+            if _demo_account["balance"] < payload.credit_cost:
+                raise HTTPException(
+                    status_code=status.HTTP_402_PAYMENT_REQUIRED,
+                    detail="Not enough demo credits. Use the configured top-up flow to add more.",
+                )
+            _demo_account["balance"] -= payload.credit_cost
+        try:
+            lab = await run_local_header_baseline(
+                target_url=settings.LAB_TARGET_URL,
+                target_name=settings.LAB_TARGET_NAME,
+                beta_url=beta_url,
+                tenant_id=principal.tenant_id,
+                authorization=request.headers.get("authorization", ""),
+            )
+        except LabDemoError as exc:
+            with _demo_account_lock:
+                _demo_account["balance"] += payload.credit_cost
+            raise HTTPException(
+                status_code=exc.status_code,
+                detail=str(exc),
+            ) from exc
+
+        now = datetime.now(timezone.utc).isoformat()
+        engagement_id = lab["beta_engagement_id"]
+        results = [
+            {
+                "id": f"{engagement_id}-finding-{index + 1}",
+                "severity": item["severity"],
+                "title": item["title"],
+                "status": item["status"],
+                "evidence": item["details"],
+            }
+            for index, item in enumerate(lab["results"])
+        ]
+        finding_count = sum(item["status"] == "finding" for item in results)
+        engagement = {
+            "id": engagement_id,
+            "campaign_id": payload.campaign_id,
+            "campaign_title": payload.campaign_title,
+            "status": "lab_assessed",
+            "credit_cost": payload.credit_cost,
+            "finding_count": finding_count,
+            "results": results,
+            "completed_at": now,
+            "target": lab["target"],
+            "target_name": lab["target_name"],
+            "http_status": lab["http_status"],
+            "beta_report": lab["beta_report"],
+            "notice": (
+                f"Local lab assessment of {lab['target_name']} ({lab['target']}). "
+                "One passive homepage request checked security headers; no exploit payloads were sent. "
+                "Delta's preview balance is simulated and is separate from the wallet "
+                "configured for Pod Beta's engagement billing."
+            ),
+        }
+        with _demo_account_lock:
+            _demo_account["total_visits"] += 1
+            _demo_account["engagements"].insert(0, engagement)
+            _demo_account["transactions"].insert(0, {
+                "id": f"{engagement_id}-debit",
+                "entry_type": "debit",
+                "amount": payload.credit_cost,
+                "currency": "CR",
+                "reference_id": f"{payload.campaign_title} · local lab",
+                "created_at": now,
+            })
+            _demo_account["notifications"].insert(0, {
+                "id": f"{engagement_id}-notification",
+                "title": "Local lab assessment completed",
+                "message": f"{payload.campaign_title}: {finding_count} header findings on {lab['target_name']}.",
+                "channel": "in-app",
+                "status": "delivered",
+                "created_at": now,
+            })
+        return {"engagement": engagement, "state": _demo_snapshot()}
+
     now = datetime.now(timezone.utc).isoformat()
     finding_count = (sum(ord(char) for char in payload.campaign_id) % 4) + 1
     engagement_id = f"demo-run-{int(datetime.now(timezone.utc).timestamp() * 1000)}"
@@ -517,17 +1049,16 @@ def run_demo_engagement(
             },
         )
     return {"engagement": engagement, "state": _demo_snapshot()}
-
-
 @router.post("/demo/reset")
 def reset_demo_account(
     request: Request,
     principal: AuthenticatedPrincipal = Depends(get_current_principal),
 ) -> dict[str, Any]:
-    global _demo_account
+    global _demo_account, _preview_account_initialized
     _require_local_demo(request, principal)
     with _demo_account_lock:
         _demo_account = _new_demo_account()
+        _preview_account_initialized = True
     return _demo_snapshot()
 
 
@@ -647,20 +1178,82 @@ async def get_wallet_history(
     principal: AuthenticatedPrincipal = Depends(get_current_principal),
     limit: int = Query(100, ge=1, le=1000),
     offset: int = Query(0, ge=0),
+    tenant_id: str | None = Query(None, min_length=1, max_length=120),
+    date_from: datetime | None = None,
+    date_to: datetime | None = None,
+    entry_type: str | None = Query(None, pattern="^(DEBIT|CREDIT|debit|credit)$"),
+    module_source: str | None = Query(None, min_length=1, max_length=32),
 ) -> Response:
     if principal.raw_claims.get("role") == "demo":
         raise HTTPException(
             status_code=status.HTTP_403_FORBIDDEN,
             detail="Wallet history is unavailable to the development demo identity",
         )
-    user_id = quote(principal.subject, safe="")
+    if tenant_id is not None and str(principal.raw_claims.get("role", "")).lower() != "admin":
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Only finance administrators can query another tenant's wallet history",
+        )
+    user_id = quote(tenant_id or principal.subject, safe="")
     return await _proxy(
         method="GET",
         base_url=_base_url(settings.WALLET_SERVICE_URL, "Wallet service"),
         path=f"/wallet/history/{user_id}",
         authorization=_wallet_authorization(principal),
-        params={"limit": limit, "offset": offset},
+        params={
+            key: value
+            for key, value in {
+                "limit": limit,
+                "offset": offset,
+                "date_from": date_from,
+                "date_to": date_to,
+                "entry_type": entry_type,
+                "module_source": module_source,
+            }.items()
+            if value is not None
+        },
     )
+
+
+@router.get("/wallet/history/export")
+async def export_wallet_history(
+    principal: AuthenticatedPrincipal = Depends(get_current_principal),
+    tenant_id: str | None = Query(None, min_length=1, max_length=120),
+    date_from: datetime | None = None,
+    date_to: datetime | None = None,
+    entry_type: str | None = Query(None, pattern="^(DEBIT|CREDIT|debit|credit)$"),
+    module_source: str | None = Query(None, min_length=1, max_length=32),
+) -> Response:
+    if principal.raw_claims.get("role") == "demo":
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Wallet audit exports are unavailable to the development demo identity",
+        )
+    if tenant_id is not None and str(principal.raw_claims.get("role", "")).lower() != "admin":
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Only finance administrators can export another tenant's wallet history",
+        )
+    user_id = quote(tenant_id or principal.subject, safe="")
+    response = await _proxy(
+        method="GET",
+        base_url=_base_url(settings.WALLET_SERVICE_URL, "Wallet service"),
+        path=f"/wallet/history/{user_id}/export",
+        authorization=_wallet_authorization(principal),
+        params={
+            key: value
+            for key, value in {
+                "date_from": date_from,
+                "date_to": date_to,
+                "entry_type": entry_type,
+                "module_source": module_source,
+            }.items()
+            if value is not None
+        },
+    )
+    if response.status_code < 400:
+        response.headers["content-disposition"] = 'attachment; filename="pod-alpha-wallet-audit.csv"'
+    return response
 
 
 @router.get("/analytics/dashboard")

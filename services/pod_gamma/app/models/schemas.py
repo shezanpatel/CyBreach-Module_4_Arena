@@ -102,6 +102,7 @@ class ResetLeaderboardResponse(BaseModel):
 class HealthResponse(BaseModel):
     status: str
     redis: str
+    database: str = "unknown"
     app: str
 
 

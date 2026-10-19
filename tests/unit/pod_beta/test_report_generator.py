@@ -80,7 +80,7 @@ class TestReportGenerator:
         assert report.refund.nodata_count == 1
         # 1 of 4 outcomes is NoData -> round(1/4 * 25) = 6 credits refund
         assert report.refund.refund_amount == 6
-        assert report.refund.refund_idempotency_key == "mod4:eng-1234:refund"
+        assert report.refund.refund_idempotency_key == "mod4:tenant-test:eng-1234:refund"
         assert "inconclusive" in report.refund.reason.lower()
         assert report.refund.sla_hours == 24
         assert report.refund.sla_deadline is not None
@@ -102,7 +102,7 @@ class TestReportGenerator:
         assert report.refund.eligible is True
         assert report.refund.nodata_count == 5
         assert report.refund.refund_amount == 100
-        assert report.refund.refund_idempotency_key == "mod4:eng-nodata-all:refund"
+        assert report.refund.refund_idempotency_key == "mod4:tenant-test:eng-nodata-all:refund"
 
     def test_zero_nodata_means_not_eligible_for_refund(self):
         """Verify when all outcomes are conclusive, refund eligibility is False."""

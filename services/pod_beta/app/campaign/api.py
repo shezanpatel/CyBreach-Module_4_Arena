@@ -11,8 +11,9 @@ import logging
 from pathlib import Path
 from typing import Dict, List, Optional
 import uuid
+from sqlalchemy import inspect, text
 
-from fastapi import APIRouter, FastAPI, HTTPException, Query
+from fastapi import APIRouter, Depends, FastAPI, HTTPException, Query
 from pydantic import BaseModel, Field
 
 from app.campaign.models import (
@@ -30,6 +31,18 @@ from app.campaign.scheduler import (
     ValidationSchedule,
     ScheduleExecutionRecord,
 )
+from app.core.security import Principal, current_principal, require_tenant
+from app.core.database import Base, SessionLocal, engine
+from app.core.db_models import (
+    BossFightSessionModel,
+    CampaignDefinitionModel,
+    CampaignScheduleStateModel,
+)
+
+Base.metadata.create_all(bind=engine)
+if "definition" not in {column["name"] for column in inspect(engine).get_columns("campaign_definition")}:
+    with engine.begin() as connection:
+        connection.execute(text('ALTER TABLE campaign_definition ADD COLUMN "definition" JSON'))
 
 logger = logging.getLogger(__name__)
 
@@ -57,6 +70,7 @@ class CampaignCatalogService:
     def reload_all(self) -> None:
         """Reload playbooks and campaigns from static JSON fixtures."""
         self.campaigns.clear()
+        self.boss_sessions.clear()
 
         # Load Module 1 playbooks fixture
         if self.playbooks_fixture.exists():
@@ -78,6 +92,49 @@ class CampaignCatalogService:
                 except Exception as exc:
                     logger.error("Failed to load campaign fixture %s: %s", json_file, exc)
 
+        # Database definitions override fixtures so API-created campaigns survive restarts.
+        with SessionLocal() as db:
+            for row in db.query(CampaignDefinitionModel).filter(CampaignDefinitionModel.definition.isnot(None)).all():
+                try:
+                    self.campaigns[row.campaign_id] = CampaignDefinition(**row.definition)
+                except Exception as exc:
+                    logger.error("Failed to load persisted campaign %s: %s", row.campaign_id, exc)
+            for row in db.query(BossFightSessionModel).all():
+                try:
+                    self.boss_sessions[row.session_id] = BossFightSession(**row.session)
+                except Exception as exc:
+                    logger.error("Failed to load boss-fight session %s: %s", row.session_id, exc)
+
+    def save_boss_session(self, session: BossFightSession) -> None:
+        """Persist session creation and each stage transition before responding."""
+        with SessionLocal() as db:
+            row = db.get(BossFightSessionModel, session.session_id)
+            if row is None:
+                row = BossFightSessionModel(
+                    session_id=session.session_id,
+                    tenant_id=session.tenant_id,
+                    campaign_id=session.campaign_id,
+                    session=session.model_dump(mode="json"),
+                )
+                db.add(row)
+            else:
+                row.tenant_id = session.tenant_id
+                row.campaign_id = session.campaign_id
+                row.session = session.model_dump(mode="json")
+            db.commit()
+        self.boss_sessions[session.session_id] = session
+
+    def get_boss_session(self, session_id: str) -> Optional[BossFightSession]:
+        """Read the database as the source of truth, including across workers."""
+        with SessionLocal() as db:
+            row = db.get(BossFightSessionModel, session_id)
+            if row is None:
+                self.boss_sessions.pop(session_id, None)
+                return None
+            session = BossFightSession(**row.session)
+        self.boss_sessions[session_id] = session
+        return session
+
     def get_campaign(self, campaign_id: str, check_hashes: bool = True) -> Optional[CampaignDefinition]:
         """Fetch campaign by ID and optionally verify hashes."""
         camp = self.campaigns.get(campaign_id)
@@ -95,12 +152,70 @@ class CampaignCatalogService:
         if not camp.content_hash:
             camp.content_hash = compute_canonical_content_hash(camp.model_dump())
         self.campaigns[camp.campaign_id] = camp
+        with SessionLocal() as db:
+            row = db.get(CampaignDefinitionModel, camp.campaign_id)
+            payload = camp.model_dump(mode="json")
+            if row is None:
+                row = CampaignDefinitionModel(
+                    campaign_id=camp.campaign_id,
+                    title=camp.title,
+                    tier=camp.tier,
+                    playbook_hashes=camp.playbook_hashes,
+                    regions=camp.regions,
+                    techniques=camp.techniques,
+                    credit_cost=camp.credit_cost,
+                    content_hash=camp.content_hash,
+                )
+                db.add(row)
+            row.title = camp.title
+            row.tier = camp.tier
+            row.playbook_hashes = camp.playbook_hashes
+            row.regions = camp.regions
+            row.techniques = camp.techniques
+            row.credit_cost = camp.credit_cost
+            row.content_hash = camp.content_hash
+            row.definition = payload
+            db.commit()
         return camp
 
 
 # Global catalog service and continuous validation scheduler engine
 catalog_service = CampaignCatalogService()
 scheduler_engine = ValidationSchedulerEngine(auto_start=False)
+
+
+def _save_schedule_state(schedule: ValidationSchedule, history: Optional[list[dict]] = None) -> None:
+    with SessionLocal() as db:
+        row = db.get(CampaignScheduleStateModel, schedule.schedule_id)
+        if row is None:
+            row = CampaignScheduleStateModel(schedule_id=schedule.schedule_id, tenant_id=schedule.tenant_id)
+            db.add(row)
+        row.tenant_id = schedule.tenant_id
+        row.schedule = schedule.model_dump(mode="json")
+        if history is not None:
+            row.history = [item.model_dump(mode="json") if isinstance(item, ScheduleExecutionRecord) else item for item in history]
+        db.commit()
+
+
+scheduler_engine._state_callback = _save_schedule_state
+
+
+def _restore_schedules() -> None:
+    with SessionLocal() as db:
+        rows = db.query(CampaignScheduleStateModel).all()
+    for row in rows:
+        try:
+            schedule = ValidationSchedule(**row.schedule)
+            scheduler_engine.add_schedule(schedule)
+            records = [ScheduleExecutionRecord(**item) for item in (row.history or [])]
+            scheduler_engine._history.extend(records)
+            if not schedule.is_active:
+                scheduler_engine.pause_schedule(schedule.schedule_id)
+        except Exception as exc:
+            logger.error("Could not restore schedule %s: %s", row.schedule_id, exc)
+
+
+_restore_schedules()
 
 
 # Request schemas
@@ -213,11 +328,13 @@ async def list_campaigns(
 
 
 @router.post("/campaigns", response_model=CampaignDefinition, status_code=201)
-async def create_campaign(req: CreateCampaignRequest):
+async def create_campaign(req: CreateCampaignRequest, principal: Principal = Depends(current_principal)):
     """
     Register a new content-addressed campaign definition.
     Enforces SHA-256 hash formatting and computes canonical content hash.
     """
+    if principal.role not in {"admin", "service"}:
+        raise HTTPException(status_code=403, detail="Administrator role is required")
     if req.campaign_id in catalog_service.campaigns:
         raise HTTPException(
             status_code=409,
@@ -237,8 +354,9 @@ async def create_campaign(req: CreateCampaignRequest):
 
 # 2. Scheduler Endpoints (Defined before /{campaign_id} to avoid route conflicts)
 @router.post("/campaigns/schedule", response_model=ValidationSchedule, status_code=201)
-async def create_schedule(req: ScheduleRequest):
+async def create_schedule(req: ScheduleRequest, principal: Principal = Depends(current_principal)):
     """Register a new recurring continuous validation schedule using APScheduler."""
+    require_tenant(principal, req.tenant_id)
     camp = catalog_service.get_campaign(req.campaign_id, check_hashes=False)
     if not camp:
         raise HTTPException(status_code=404, detail=f"Campaign '{req.campaign_id}' not found")
@@ -257,76 +375,112 @@ async def create_schedule(req: ScheduleRequest):
 
     try:
         created = scheduler_engine.add_schedule(schedule)
+        _save_schedule_state(created)
         return created
     except ValueError as ve:
         raise HTTPException(status_code=400, detail=str(ve))
 
 
 @router.get("/campaigns/schedules", response_model=List[ValidationSchedule])
-async def list_schedules(tenant_id: Optional[str] = Query(None)):
+async def list_schedules(tenant_id: Optional[str] = Query(None), principal: Principal = Depends(current_principal)):
     """List recurring validation schedules, optionally filtered by tenant."""
+    tenant_id = tenant_id or principal.tenant_id
+    require_tenant(principal, tenant_id)
     return scheduler_engine.list_schedules(tenant_id=tenant_id)
 
 
 @router.get("/campaigns/schedules/{schedule_id}", response_model=ValidationSchedule)
-async def get_schedule_endpoint(schedule_id: str):
+async def get_schedule_endpoint(schedule_id: str, principal: Principal = Depends(current_principal)):
     """Get schedule details by ID."""
     sched = scheduler_engine.get_schedule(schedule_id)
     if not sched:
         raise HTTPException(status_code=404, detail=f"Schedule '{schedule_id}' not found")
+    require_tenant(principal, sched.tenant_id)
     return sched
 
 
 @router.post("/campaigns/schedules/{schedule_id}/pause", response_model=ValidationSchedule)
-async def pause_schedule_endpoint(schedule_id: str):
+async def pause_schedule_endpoint(schedule_id: str, principal: Principal = Depends(current_principal)):
     """Pause an active recurring schedule."""
+    sched = scheduler_engine.get_schedule(schedule_id)
+    if not sched:
+        raise HTTPException(status_code=404, detail=f"Schedule '{schedule_id}' not found")
+    require_tenant(principal, sched.tenant_id)
     try:
-        return scheduler_engine.pause_schedule(schedule_id)
+        paused = scheduler_engine.pause_schedule(schedule_id)
+        _save_schedule_state(paused)
+        return paused
     except KeyError:
         raise HTTPException(status_code=404, detail=f"Schedule '{schedule_id}' not found")
 
 
 @router.post("/campaigns/schedules/{schedule_id}/resume", response_model=ValidationSchedule)
-async def resume_schedule_endpoint(schedule_id: str):
+async def resume_schedule_endpoint(schedule_id: str, principal: Principal = Depends(current_principal)):
     """Resume a paused schedule."""
+    sched = scheduler_engine.get_schedule(schedule_id)
+    if not sched:
+        raise HTTPException(status_code=404, detail=f"Schedule '{schedule_id}' not found")
+    require_tenant(principal, sched.tenant_id)
     try:
-        return scheduler_engine.resume_schedule(schedule_id)
+        resumed = scheduler_engine.resume_schedule(schedule_id)
+        _save_schedule_state(resumed)
+        return resumed
     except KeyError:
         raise HTTPException(status_code=404, detail=f"Schedule '{schedule_id}' not found")
 
 
 @router.delete("/campaigns/schedules/{schedule_id}")
-async def delete_schedule_endpoint(schedule_id: str):
+async def delete_schedule_endpoint(schedule_id: str, principal: Principal = Depends(current_principal)):
     """Remove a recurring validation schedule."""
+    sched = scheduler_engine.get_schedule(schedule_id)
+    if not sched:
+        raise HTTPException(status_code=404, detail=f"Schedule '{schedule_id}' not found")
+    require_tenant(principal, sched.tenant_id)
     success = scheduler_engine.remove_schedule(schedule_id)
+    if success:
+        with SessionLocal() as db:
+            db.query(CampaignScheduleStateModel).filter_by(schedule_id=schedule_id).delete()
+            db.commit()
     if not success:
         raise HTTPException(status_code=404, detail=f"Schedule '{schedule_id}' not found")
     return {"status": "deleted", "schedule_id": schedule_id}
 
 
 @router.post("/campaigns/schedules/{schedule_id}/trigger", response_model=ScheduleExecutionRecord)
-async def trigger_schedule_now_endpoint(schedule_id: str):
+async def trigger_schedule_now_endpoint(schedule_id: str, principal: Principal = Depends(current_principal)):
     """Manually trigger immediate execution of a scheduled campaign."""
+    sched = scheduler_engine.get_schedule(schedule_id)
+    if not sched:
+        raise HTTPException(status_code=404, detail=f"Schedule '{schedule_id}' not found")
+    require_tenant(principal, sched.tenant_id)
     try:
         record = scheduler_engine.trigger_now(schedule_id)
+        schedule = scheduler_engine.get_schedule(schedule_id)
+        if schedule:
+            _save_schedule_state(schedule, [item.model_dump(mode="json") for item in scheduler_engine.get_execution_history(schedule_id=schedule_id)])
         return record
     except KeyError:
         raise HTTPException(status_code=404, detail=f"Schedule '{schedule_id}' not found")
 
 
 @router.get("/campaigns/schedules/{schedule_id}/history", response_model=List[ScheduleExecutionRecord])
-async def get_schedule_history(schedule_id: str):
+async def get_schedule_history(schedule_id: str, principal: Principal = Depends(current_principal)):
     """Get execution history for a schedule."""
+    sched = scheduler_engine.get_schedule(schedule_id)
+    if not sched:
+        raise HTTPException(status_code=404, detail=f"Schedule '{schedule_id}' not found")
+    require_tenant(principal, sched.tenant_id)
     return scheduler_engine.get_execution_history(schedule_id=schedule_id)
 
 
 # 3. Boss Fight Global Session Query
 @router.get("/campaigns/boss-fight/{session_id}", response_model=BossFightSession)
-async def get_boss_fight_session(session_id: str):
+async def get_boss_fight_session(session_id: str, principal: Principal = Depends(current_principal)):
     """Get state of a boss fight session."""
-    session = catalog_service.boss_sessions.get(session_id)
+    session = catalog_service.get_boss_session(session_id)
     if not session:
         raise HTTPException(status_code=404, detail=f"Boss fight session '{session_id}' not found")
+    require_tenant(principal, session.tenant_id)
     return session
 
 
@@ -354,8 +508,9 @@ async def verify_hashes_endpoint(campaign_id: str):
 
 
 @router.post("/campaigns/{campaign_id}/boss-fight/start", response_model=BossFightSession)
-async def start_boss_fight(campaign_id: str, req: StartBossFightRequest):
+async def start_boss_fight(campaign_id: str, req: StartBossFightRequest, principal: Principal = Depends(current_principal)):
     """Start an interactive multi-stage boss fight session."""
+    require_tenant(principal, req.tenant_id)
     camp = catalog_service.get_campaign(campaign_id, check_hashes=False)
     if not camp:
         raise HTTPException(status_code=404, detail=f"Campaign '{campaign_id}' not found")
@@ -380,6 +535,7 @@ async def start_boss_fight(campaign_id: str, req: StartBossFightRequest):
         total_stages=len(camp.stages),
     )
     catalog_service.boss_sessions[session_id] = session
+    catalog_service.save_boss_session(session)
     return session
 
 
@@ -388,14 +544,16 @@ async def submit_boss_fight_stage(
     campaign_id: str,
     session_id: str,
     req: SubmitStageResultRequest,
+    principal: Principal = Depends(current_principal),
 ):
     """
     Submit outcome for a boss fight stage.
     Enforces sequential progression, prerequisite completion, and composite scoring.
     """
-    session = catalog_service.boss_sessions.get(session_id)
+    session = catalog_service.get_boss_session(session_id)
     if not session:
         raise HTTPException(status_code=404, detail=f"Boss fight session '{session_id}' not found")
+    require_tenant(principal, session.tenant_id)
 
     if session.campaign_id != campaign_id:
         raise HTTPException(status_code=400, detail="Session does not match campaign ID")
@@ -415,13 +573,24 @@ async def submit_boss_fight_stage(
             score=req.score,
             evidence_ref=req.evidence_ref,
         )
+        catalog_service.save_boss_session(session)
         return session
     except ValueError as ve:
         raise HTTPException(status_code=400, detail=str(ve))
 
 
-app = FastAPI(title="CyBreach Campaign Catalog API", version="2.0.0")
+app = FastAPI(title="CyBreach Campaign Catalog API", version="2.0.0", dependencies=[Depends(current_principal)])
 app.include_router(router)
+
+
+@app.on_event("startup")
+async def start_scheduler() -> None:
+    scheduler_engine.start()
+
+
+@app.on_event("shutdown")
+async def stop_scheduler() -> None:
+    scheduler_engine.shutdown(wait=False)
 
 
 @app.get("/", include_in_schema=False)

@@ -68,10 +68,10 @@ class TestEngagementEndpoints:
         new_balance = await wallet.get_balance("tenant_high")
         assert new_balance == init_balance - 25
 
-        # Verify idempotency key format: mod4:{engagement_id}
+        # Verify tenant-scoped Module 4 idempotency key.
         entries = wallet.get_entries("tenant_high")
         assert len(entries) == 1
-        assert entries[0].idempotency_key == f"mod4:{engagement_id}"
+        assert entries[0].idempotency_key == f"mod4:tenant_high:{engagement_id}:debit"
         assert entries[0].amount == 25
         assert entries[0].module_source == "mod4"
 
@@ -295,7 +295,7 @@ class TestEngagementEndpoints:
         assert report["refund"]["eligible"] is True
         # 1/2 of 25 = 12 credits refund (Python bankers rounding)
         assert report["refund"]["refund_amount"] == 12
-        assert report["refund"]["refund_idempotency_key"] == f"mod4:{eng_id}:refund"
+        assert report["refund"]["refund_idempotency_key"] == f"mod4:tenant_high:{eng_id}:refund"
 
         # Verify wallet was credited back 12 credits automatically
         bal_after_refund = await wallet.get_balance("tenant_high")

@@ -79,11 +79,13 @@ class ValidationSchedulerEngine:
         self,
         execution_handler: Optional[Callable[[ValidationSchedule], ScheduleExecutionRecord]] = None,
         auto_start: bool = False,
+        state_callback: Optional[Callable[[ValidationSchedule, List[ScheduleExecutionRecord]], None]] = None,
     ):
         self._scheduler = BackgroundScheduler(timezone="UTC")
         self._schedules: Dict[str, ValidationSchedule] = {}
         self._history: List[ScheduleExecutionRecord] = []
         self._execution_handler = execution_handler or self._default_execution_handler
+        self._state_callback = state_callback
 
         if auto_start:
             self.start()
@@ -148,6 +150,12 @@ class ValidationSchedulerEngine:
             next_time = getattr(job, "next_run_time", None)
             if next_time:
                 schedule.next_run_at = next_time
+        if self._state_callback:
+            try:
+                schedule_history = [item for item in self._history if item.schedule_id == schedule_id]
+                self._state_callback(schedule, schedule_history)
+            except Exception:
+                logger.exception("Could not persist schedule state %s", schedule_id)
 
     def _build_trigger(self, schedule: ValidationSchedule):
         """Construct an APScheduler trigger based on schedule parameters."""

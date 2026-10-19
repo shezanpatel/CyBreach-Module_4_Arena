@@ -1,233 +1,73 @@
-﻿BENCHMARK_DATA = [
-    {
-        "industry": "Technology",
-        "region": "West",
-        "size_band": "Large",
-        "peer_count": 20,
-        "peer_25th": 65.20,
-        "peer_median": 76.40,
-        "peer_75th": 88.10,
-    },
-    {
-        "industry": "Technology",
-        "region": "West",
-        "size_band": "Medium",
-        "peer_count": 18,
-        "peer_25th": 61.30,
-        "peer_median": 72.50,
-        "peer_75th": 84.70,
-    },
-    {
-        "industry": "Technology",
-        "region": "North",
-        "size_band": "Large",
-        "peer_count": 16,
-        "peer_25th": 62.50,
-        "peer_median": 75.10,
-        "peer_75th": 87.30,
-    },
-    {
-        "industry": "Finance",
-        "region": "West",
-        "size_band": "Large",
-        "peer_count": 15,
-        "peer_25th": 60.10,
-        "peer_median": 71.20,
-        "peer_75th": 83.50,
-    },
-    {
-        "industry": "Finance",
-        "region": "North",
-        "size_band": "Medium",
-        "peer_count": 19,
-        "peer_25th": 64.20,
-        "peer_median": 73.60,
-        "peer_75th": 85.40,
-    },
-    {
-        "industry": "Healthcare",
-        "region": "West",
-        "size_band": "Large",
-        "peer_count": 17,
-        "peer_25th": 63.40,
-        "peer_median": 74.80,
-        "peer_75th": 86.20,
-    },
-    {
-        "industry": "Healthcare",
-        "region": "South",
-        "size_band": "Medium",
-        "peer_count": 15,
-        "peer_25th": 58.70,
-        "peer_median": 69.90,
-        "peer_75th": 81.50,
-    },
+"""Database-backed benchmark reads. No runtime cohort fixtures are used."""
 
-    # PG-27 test case: fewer than 10 peers
-    {
-        "industry": "Finance",
-        "region": "West",
-        "size_band": "Small",
-        "peer_count": 8,
-        "peer_25th": 55.00,
-        "peer_median": 63.00,
-        "peer_75th": 72.00,
-    },
+from sqlalchemy import text
 
-    # PG-25 global benchmark
-    {
-        "industry": "ALL",
-        "region": "GLOBAL",
-        "size_band": "ALL",
-        "peer_count": 100,
-        "peer_25th": 60.00,
-        "peer_median": 72.00,
-        "peer_75th": 84.00,
-    },
-]
+from app.db import SessionLocal
 
 
 async def get_benchmark_aggregate(
     industry: str,
     region: str,
     size_band: str,
-):
-    """
-    Return the benchmark aggregate for a specific cohort.
-    """
-
-    for record in BENCHMARK_DATA:
-        if (
-            record["industry"] == industry
-            and record["region"] == region
-            and record["size_band"] == size_band
-        ):
-            return record
-
-    return None
-
-
-async def get_available_benchmark_cohorts(min_peer_count: int):
-    """Return only cohort dimensions with enough peers for a comparison."""
-    return [
-        {
-            "industry": record["industry"],
-            "region": record["region"],
-            "size_band": record["size_band"],
-            "peer_count": record["peer_count"],
-        }
-        for record in BENCHMARK_DATA
-        if record["industry"] != "ALL"
-        and record["peer_count"] >= min_peer_count
-    ]
+) -> dict | None:
+    query = text(
+        """
+        SELECT industry, region, size_band, peer_count,
+               peer_25th, peer_median, peer_75th
+        FROM benchmark_aggregate
+        WHERE industry = :industry AND region = :region AND size_band = :size_band
+        LIMIT 1
+        """
+    )
+    async with SessionLocal() as session:
+        result = await session.execute(
+            query,
+            {"industry": industry, "region": region, "size_band": size_band},
+        )
+        row = result.mappings().first()
+        return dict(row) if row else None
 
 
-async def get_global_benchmark():
-    """
-    Return the global benchmark aggregate used by PG-25.
-    """
-
-    for record in BENCHMARK_DATA:
-        if (
-            record["industry"] == "ALL"
-            and record["region"] == "GLOBAL"
-            and record["size_band"] == "ALL"
-        ):
-            return record
-
-    return None
+async def get_available_benchmark_cohorts(min_peer_count: int) -> list[dict]:
+    query = text(
+        """
+        SELECT industry, region, size_band, peer_count
+        FROM benchmark_aggregate
+        WHERE industry <> 'ALL' AND peer_count >= :minimum
+        ORDER BY industry, region, size_band
+        """
+    )
+    async with SessionLocal() as session:
+        result = await session.execute(query, {"minimum": min_peer_count})
+        return [dict(row) for row in result.mappings().all()]
 
 
-# ============================================================
-# PG-28 Historical Benchmark Test Data
-# ============================================================
-
-BENCHMARK_HISTORY = [
-    # TENANT-001: 30 days ago
-    {
-        "tenant_id": "TENANT-001",
-        "industry": "Technology",
-        "region": "West",
-        "size_band": "Large",
-        "p25": 60.20,
-        "median": 71.40,
-        "p75": 82.10,
-        "days_ago": 30,
-    },
-
-    # TENANT-001: 60 days ago
-    {
-        "tenant_id": "TENANT-001",
-        "industry": "Technology",
-        "region": "West",
-        "size_band": "Large",
-        "p25": 58.30,
-        "median": 69.50,
-        "p75": 80.70,
-        "days_ago": 60,
-    },
-
-    # TENANT-001: 90 days ago
-    {
-        "tenant_id": "TENANT-001",
-        "industry": "Technology",
-        "region": "West",
-        "size_band": "Large",
-        "p25": 55.80,
-        "median": 67.20,
-        "p75": 78.90,
-        "days_ago": 90,
-    },
-
-    # TENANT-002: 30 days ago
-    {
-        "tenant_id": "TENANT-002",
-        "industry": "Finance",
-        "region": "West",
-        "size_band": "Large",
-        "p25": 62.10,
-        "median": 73.20,
-        "p75": 84.50,
-        "days_ago": 30,
-    },
-
-    # TENANT-002: 60 days ago
-    {
-        "tenant_id": "TENANT-002",
-        "industry": "Finance",
-        "region": "West",
-        "size_band": "Large",
-        "p25": 60.40,
-        "median": 71.10,
-        "p75": 82.70,
-        "days_ago": 60,
-    },
-
-    # TENANT-002: 90 days ago
-    {
-        "tenant_id": "TENANT-002",
-        "industry": "Finance",
-        "region": "West",
-        "size_band": "Large",
-        "p25": 57.90,
-        "median": 68.80,
-        "p75": 80.30,
-        "days_ago": 90,
-    },
-]
+async def get_global_benchmark() -> dict | None:
+    query = text(
+        """
+        SELECT industry, region, size_band, peer_count,
+               peer_25th, peer_median, peer_75th
+        FROM benchmark_aggregate
+        WHERE industry = 'ALL' AND region = 'GLOBAL' AND size_band = 'ALL'
+        LIMIT 1
+        """
+    )
+    async with SessionLocal() as session:
+        result = await session.execute(query)
+        row = result.mappings().first()
+        return dict(row) if row else None
 
 
-async def get_benchmark_history(tenant_id: str):
-    """
-    Return historical benchmark snapshots for a tenant.
-
-    This is currently local test data.
-    The production implementation will query
-    benchmark_historical from the database.
-    """
-
-    return [
-        record
-        for record in BENCHMARK_HISTORY
-        if record["tenant_id"] == tenant_id
-    ]
+async def get_benchmark_history(tenant_id: str) -> list[dict]:
+    query = text(
+        """
+        SELECT tenant_id, p25, median, p75,
+               CURRENT_DATE - snapshot_date AS days_ago
+        FROM benchmark_historical
+        WHERE tenant_id = :tenant_id
+        ORDER BY snapshot_date DESC
+        """
+    )
+    async with SessionLocal() as session:
+        result = await session.execute(query, {"tenant_id": tenant_id})
+        return [dict(row) for row in result.mappings().all()]

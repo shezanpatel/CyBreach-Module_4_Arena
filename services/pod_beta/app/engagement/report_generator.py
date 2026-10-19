@@ -278,8 +278,8 @@ class ReportGenerator:
             refund_amount = round((nodata_count / total_tested) * debited_credits)
             # Ensure at least 1 credit refunded if eligible and debited > 0
             refund_amount = max(1, min(refund_amount, debited_credits))
-            # Format idempotency key: mod4:{engagement_id}:refund (matches PDF specification)
-            refund_idempotency_key = f"mod4:{engagement_id}:refund"
+            # Wallet contract: mod4:{tenant_id}:{engagement_id}:refund
+            refund_idempotency_key = f"mod4:{tenant_id}:{engagement_id}:refund"
             refund_reason = (
                 f"Automatic refund for {nodata_count} inconclusive (NoData) validation outcome(s) "
                 f"out of {total_tested} total tests."

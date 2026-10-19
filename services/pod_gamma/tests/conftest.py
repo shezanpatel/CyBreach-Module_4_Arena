@@ -3,6 +3,12 @@
 from __future__ import annotations
 
 from collections.abc import Generator
+import os
+
+os.environ.setdefault(
+    "DATABASE_URL",
+    "postgresql+asyncpg://test_user:test_password@127.0.0.1:5432/test_database",
+)
 
 import fakeredis
 import pytest

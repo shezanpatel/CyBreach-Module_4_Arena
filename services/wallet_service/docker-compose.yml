@@ -1,4 +1,4 @@
-﻿services:
+services:
   postgres:
     image: postgres:16
     container_name: wallet-postgres
@@ -9,18 +9,11 @@
     command:
       - postgres
       - -c
-      - wal_level=replica
-      - -c
-      - archive_mode=on
-      - -c
-      - archive_command=test ! -f /var/lib/postgresql/wal_archive/%f && cp %p /var/lib/postgresql/wal_archive/%f
-      - -c
-      - archive_timeout=60s
+      - max_wal_senders=0
     ports:
-      - "5432:5432"
+      - "127.0.0.1:5432:5432"
     volumes:
       - postgres_data:/var/lib/postgresql/data
-      - postgres_wal_archive:/var/lib/postgresql/wal_archive
 
   redpanda:
     image: redpandadata/redpanda:latest
@@ -43,9 +36,9 @@
       - --advertise-kafka-addr
       - internal://redpanda:9092,external://localhost:19092
     ports:
-      - "9092:9092"
-      - "19092:19092"
-      - "9644:9644"
+      - "127.0.0.1:9092:9092"
+      - "127.0.0.1:19092:19092"
+      - "127.0.0.1:9644:9644"
 
   wallet-service:
     build: .
@@ -61,8 +54,7 @@
       - postgres
       - redpanda
     ports:
-      - "8000:8000"
+      - "127.0.0.1:8004:8000"
 
 volumes:
   postgres_data:
-  postgres_wal_archive:
