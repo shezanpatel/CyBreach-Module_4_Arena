@@ -102,6 +102,25 @@ docker --version
 docker compose version
 ```
 
+### Docker installation (Windows)
+If Docker Desktop is not installed, install it from PowerShell (requires winget) or the official installer:
+
+```powershell
+winget install --exact --id Docker.DockerDesktop
+```
+
+After installation:
+1. Start **Docker Desktop** from the Start menu and wait for it to finish initializing.
+2. Verify it is running:
+   ```powershell
+   docker info
+   docker compose version
+   ```
+3. Docker Compose v2 is included with Docker Desktop; use `docker compose` (not the older `docker-compose`).
+
+Docker is required to run the backing infrastructure (Redis, Redpanda/Kafka, PostgreSQL, ClickHouse) for Pod Delta, PostgreSQL for Pod Gamma, and the Wallet database container.
+
+
 ## 5. Installation - Step by Step
 
 ### Step A: Extract / clone the repository
